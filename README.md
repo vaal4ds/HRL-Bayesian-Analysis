@@ -27,7 +27,7 @@ The primary purpose of this project is to:
 1.  Apply Bayesian hierarchical modeling to analyze human reinforcement learning behavior.
 2.  Compare different model complexities (non-hierarchical, hierarchical, and hierarchical with additional parameters) to determine which best explains the observed data.
 3.  Characterize individual differences in learning and decision-making parameters.
-4.  Provide a reproducible workflow for conducting similar analyses.
+4.  Provide a reproducible workflow for conducting similar analyses (frequentist approach).
 
 ## Data Source
 
