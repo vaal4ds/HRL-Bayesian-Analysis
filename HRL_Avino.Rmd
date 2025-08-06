@@ -1,0 +1,2391 @@
+---
+title: "Hierarchical RL Bayesian Analysis"
+author: "Valeria Avino"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true         
+    toc_depth: 3      
+    toc_float:       
+      collapsed: true 
+      smooth_scroll: true 
+    highlight: textmate 
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+  message = FALSE, # Suppress all messages (e.g., package startup messages)
+  warning = FALSE  # Suppress all warnings (e.g., package load warnings)
+)
+```
+
+# Introduction
+
+This project analyzes human behavior in a **reinforcement learning** (RL) task using a **Bayesian hierarchical modeling** framework. The dataset, sourced from the behavioral study by [Gershman et al. (2015)](https://doi.org/10.1016/j.jmp.2021.102602), investigates reinforcement-driven decision-making using a two-armed bandit task. The dataset provides trial-by-trial records of choices and outcomes across multiple participants and experiments.
+
+### Task design
+
+Each trial proceeds as follows:
+
+1. A **stimulus** (one of four possible visual cues) is presented to one of the 205 subjects;
+
+2. The participant chooses between two options: **left (1)** or **right (2)**,
+(based on the choice they "feel" will be rewarded);
+
+3. A **reward** is delivered (1 = rewarded, 0 = not rewarded), drawn from a fixed probabilistic distribution specific to that stimulus.
+
+Participants needed to learn, through trial and error, which option is more rewarding for each stimulus (4 different stimuli per subject, experienced in randomized order). 
+
+The dataset includes the choices and outcomes of **100 trials** across **205 participants**, for a total of 20,500 records. After the pre-processing (applied in the `preprocessing.R` script) the resulting `rl_data.RData` dataset:
+
+
+```{r summary dataset, echo=FALSE,message=FALSE, warning=FALSE}
+load("rl_data.RData")
+library(dplyr)
+library(knitr)
+
+# Check for missing values across key columns
+n_missing <- sum(
+  is.na(rl_data$trial_number) |
+  is.na(rl_data$game) |
+  is.na(rl_data$c) |
+  is.na(rl_data$r) |
+  is.na(rl_data$name)
+)
+
+# Prepare the summary stats
+dataset_summary <- tibble::tibble(
+  Feature = c(
+    "Number of subjects",
+    "Number of trials per subject",
+    "Total number of trials",
+    "Number of stimuli",
+    "Stimulus IDs",
+    "Number of choices",
+    "Choice options",
+    "Missing values in key columns"
+  ),
+   Value = c(
+    length(unique(rl_data$name)),
+    "100",
+    nrow(rl_data),
+    length(unique(rl_data$game)),
+    paste(sort(unique(rl_data$game)), collapse = ", "),
+    length(unique(rl_data$c)),
+    paste(sort(unique(rl_data$c)), collapse = ", "),
+    ifelse(n_missing == 0, "None", as.character(n_missing))
+  )
+)
+
+# Print the table
+kable(dataset_summary, caption = "Summary of Main Features in the RL Dataset")
+cat('Preview of the cleaned dataset')
+head(rl_data)
+```
+
+
+* `prob`: Underlying reward probability of the chosen action
+* `c`: Choice made (1 = left, 2 = right)                                                
+* `r`:Binary reward received (1 = reward, 0 = no reward) $\sim$ Bernoulli(`prob`)        
+* `N`: Total number of trials (used for data cleaning) 
+* `name`: Subject identifier  
+* `trial_number`: Trial index (1–100) 
+* `game`/ `stim_id`: visual cue identifier (1–4) 
+* `stick`: bias toward repeating the previous choice, **independent of reward history**
+
+      - A value of `+0.5` indicates that previous choice was left,
+      - A value of `–0.5` indicates that previous choice was left,
+      - A value of `0` is assigned to the first trial, where no previous action exists
+      
+* `choice_two` : binary choice made (1 = left, 0 = right)
+
+
+Observation:
+
+The `prob` column contains the **reward probability assigned to the chosen option** on each trial. This is **not** a probability prediction from the model, but rather a property of the experimental environment — it encodes the likelihood that a particular choice will be rewarded in that stimulus block. While not used directly in the JAGS models, it is useful for exploratory analysis and visualizing **true vs. learned reward structures**.
+
+The `stim` variable indexes the **block** or **stimulus context**. Each stimulus is associated with a fixed pair of reward probabilities (e.g., left = 0.2, right = 0.8) over 25 trials.  
+
+The primary goal is to understand and quantify **how humans learn from feedback** and adapt their choices over time. To achieve this,  three alternative models that capture plausible cognitive strategies, grounded in **Q-learning** are developed and estimated.
+
+
+### Inferential Questions
+
+The key inferential objectives are to:
+
+- **Model subject-level cognitive strategies** 
+- **Quantify learning rates, biases and value difference sensitivity**
+- **Establish if consecutive trial dependencies affect cognitive strategies **
+
+
+
+## Exploratory Data Analysis
+
+To justify the interest of the analysis and motivate models' parameters we may investigate the nature of the dataset.
+
+### Switching Behaviour
+
+To explore whether participants adjusted their behavior based on **reward feedback** — a key feature of reinforcement learning — we examined trial-by-trial **switching behavior**.
+
+Specifically, we can compute each subject’s **probability of switching choices depending on whether the previous trial was rewarded**. 
+We are estimating the following conditional probabilities:
+$$\mathbb{P}(c_{t+1}\neq x| c_t=x, r_t=0)$$
+$$\mathbb{P}(c_{t+1}\neq x| c_t=x, r_t=1)$$
+
+Subjects who learn from reward are expected to repeat actions that led to a reward and switch more often after unrewarded outcomes.
+
+```{r switch rates, echo=FALSE,  message=FALSE, warning=FALSE}
+library(ggplot2)
+
+# sorting by trial number to relate to them 'temporally'
+rl_data <- rl_data[order(rl_data$name, rl_data$trial_number), ]
+
+# auxiliary column with previous choice
+rl_data$prev_choice <- ave(rl_data$c, rl_data$name, FUN = function(x) c(NA, head(x, -1)))
+
+# auxiliary column with previous reward
+rl_data$prev_reward <- ave(rl_data$r, rl_data$name, FUN = function(x) c(NA, head(x, -1)))
+
+# binary indicator: 1 = switched from previous trial, 0 = repeated
+rl_data$switched <- ifelse(rl_data$c != rl_data$prev_choice, 1, 0)
+
+# 1. Calculate the overall average switch rate with confidence intervals
+# Filter out NAs from the first trial of each subject
+switch_by_rew_summary <- rl_data %>%
+  filter(!is.na(prev_reward)) %>%
+  group_by(prev_reward) %>%
+  summarise(
+    mean_switched = mean(switched, na.rm = TRUE),
+    sd_switched = sd(switched, na.rm = TRUE),
+    n = n(),
+    se_switched = sd_switched / sqrt(n),
+    lower_ci = mean_switched - 1.96 * se_switched, # Approximate 95% CI
+    upper_ci = mean_switched + 1.96 * se_switched, # Approximate 95% CI
+    .groups = 'drop'
+  ) %>%
+  mutate(
+    prev_reward_label = ifelse(prev_reward == 0, "No Reward (0)", "Reward (1)")
+  )
+
+# 2. Calculate individual subject switch rates for overlaying
+individual_switch_rates <- rl_data %>%
+  filter(!is.na(prev_reward)) %>%
+  group_by(name, prev_reward) %>%
+  summarise(
+    subject_switched_rate = mean(switched, na.rm = TRUE),
+    .groups = 'drop'
+  ) %>%
+  mutate(
+    prev_reward_label = ifelse(prev_reward == 0, "No Reward (0)", "Reward (1)")
+  )
+
+# bar plot
+ggplot(switch_by_rew_summary, aes(x = prev_reward_label, y = mean_switched, fill = prev_reward_label)) +
+  geom_bar(stat = "identity", position = position_dodge(width = 0.8), width = 0.7) +
+  # Add error bars
+  geom_errorbar(aes(ymin = lower_ci, ymax = upper_ci),
+                width = 0.25, position = position_dodge(width = 0.8), size = 0.8) +
+  # Overlay individual subject points 
+  geom_point(data = individual_switch_rates,
+             aes(x = prev_reward_label, y = subject_switched_rate),
+             position = position_jitter(width = 0.15, height = 0), # Jitter points to prevent overlap
+             color = "#BDBEDD", alpha = 0.6, size = 1.5) +
+  labs(
+    title = "Switch Rate After Reward vs. No Reward",
+    x = "Previous Trial Outcome",
+    y = "Mean Switch Rate (Proportion)",
+    fill = "Previous Reward"
+  ) +
+  scale_fill_manual(values = c("No Reward (0)" = "#E095A4", "Reward (1)" = "#827BB2")) + # More appealing colors
+  scale_y_continuous(limits = c(0, 1), breaks = seq(0, 1, 0.2)) + # Ensure Y-axis goes from 0 to 1
+  theme_minimal(base_size = 14) + # Increase base font size for readability
+  theme(
+    legend.position = "none", 
+    axis.text.x = element_text(size = 11),
+    axis.text.y = element_text(size = 11)
+  )
+```
+
+```{r subj switch rates, echo=FALSE}
+subj_switch_by_rew <- aggregate(switched ~ name + prev_reward, data = rl_data, mean)
+
+# Reshape to plot
+switch_wide <- reshape(subj_switch_by_rew, 
+                       idvar = "name", 
+                       timevar = "prev_reward", 
+                       direction = "wide")
+
+# Rename columns
+colnames(switch_wide) <- c("subject", "switch_no_reward", "switch_reward")
+
+# Plot as paired points per subject
+library(ggplot2)
+
+ggplot(switch_wide, aes(x = switch_no_reward, y = switch_reward)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "#542522") +
+  geom_point(color = "#C2A5C9", alpha = 0.7) +
+  labs(title = "Subject-wise Switch Rate: No Reward vs Reward",
+       x = "Switch Rate After No Reward", y = "Switch Rate After Reward") +
+  theme_minimal()
+```
+
+The plot shows that, on average across trials, subjects are **less likely to switch their choice after receiving a reward**. This indicates that **rewards reinforce the previous decision** — when a choice is rewarded, participants tend to stick with it in the next trial, suggesting that learning has occurred.
+
+The wide vertical spread of dots within each bar visually confirms that individual subjects have very different switch rates. This extreme variability between individuals is strong evidence for why the **hierarchical** model is necessary, as it **allows parameters** like the learning rate ($\alpha$) **to vary across subjects**.
+
+The second plot better captures **per-subject** switch rates following rewarded and unrewarded trials. It confirms that the majority of subjects shows a **lower switch rate after receiving a reward**, indicating **learning-driven** behavior. 
+
+Such exploratory analysis indicates sensitivity to feedback. This supports the inclusion of a **learning rate** parameter in our model to capture individual differences in how strongly participants update their value estimates based on recent outcomes.
+
+### Learning curves
+
+We may investigate the reward distribution and check if it tends to improve over time, i.e. if, on the group-level, subjects tend to learn over trials.
+
+```{r avg reward over trials, echo = FALSE}
+
+library(dplyr)
+
+rl_avg_performance <- rl_data %>%
+  group_by(trial_number) %>%
+  summarise(
+    mean_reward = mean(r, na.rm = TRUE),
+    sd_reward = sd(r, na.rm = TRUE),
+    n_subjects = n_distinct(name)
+  ) %>%
+  mutate(
+    se_reward = sd_reward / sqrt(n_subjects),
+    lower_ci = mean_reward - 1.96 * se_reward, # Approx 95% CI
+    upper_ci = mean_reward + 1.96 * se_reward
+  )
+
+ggplot(rl_avg_performance, aes(x = trial_number, y = mean_reward)) +
+  geom_line(color = "steelblue", size = 1) +
+  geom_ribbon(aes(ymin = lower_ci, ymax = upper_ci), alpha = 0.2, fill = "steelblue") +
+  labs(
+    title = "Average Reward Over Trials (All Subjects)",
+    x = "Trial Number",
+    y = "Mean Reward"
+  ) +
+  theme_minimal()
+
+```
+
+Looking at the graph, the mean reward curve fluctuates around $0.5$ throughout the $100$ trials, staying mostly between $0.45$ and $0.55$. As the reward is binary ($0$ or $1$), the mean reward on any given trial effectively represents the **proportion of subjects receiving a reward** of $1$. The shaded *confidence interval* is quite wide, indicating substantial *subject-to-subject variability* around the mean at any given trial.
+
+This aggregate view, while informative, reveals no strong upward trend in mean reward over the $100$ trials, suggesting that, on average, the group did not exhibit a clear or consistent improvement in performance throughout the experiment. The wide confidence band surrounding the mean highlights substantial variability in reward outcomes across subjects at any given trial, hinting at underlying individual differences.
+
+To delve deeper into this observed heterogeneity, we should look at the following Individual Subject Reward Over Trials plots for a random selection of participants (given the high number ogìf subjects).
+
+
+```{r individual lear curves, echo=FALSE}
+
+# Plotting individual learning curves using facet_wrap
+
+# Get a list of unique subject IDs
+all_subject<- unique(rl_data$name)
+
+# Plotting individual learning curves for a *subset* of subjects 
+set.seed(1234)
+subjects_to_plot <- sample(all_subject, 9) # Plot 6 unique random subjects
+
+ggplot(rl_data %>% filter(name %in% subjects_to_plot),
+       aes(x = trial_number, y = r, group = name)) +
+  geom_line(alpha = 0.7, color = "darkblue") + 
+  facet_wrap(~ factor(name), scales = "free_y") +
+  labs(
+    title = "Individual Subject Reward Over Trials (Selected Subjects)",
+    x = "Trial Number",
+    y = "Reward"
+  ) +
+  theme_minimal() +
+  theme(strip.text = element_text(size = 8)) # Adjust facet label size if needed
+```
+
+
+These plots vividly demonstrate the trial-by-trial sequence of binary rewards for each individual. Crucially, they confirm the presence of considerable **individual-level variability**, with participants exhibiting diverse and often 'noisy' reward sequences. The absence of consistently smooth learning curves within individuals, characterized by frequent oscillations between 0 and 1 rewards, underscores the challenges inherent in accurately estimating individual cognitive parameters from such data.
+
+This justifies the need for a statistical pooling of information across subjects:
+if we tried to fit a non-hierarchical model to each subject's data independently, the resulting parameter estimates for $\alpha$ and $\beta$ would likely be very unstable due to the "noisy" nature of these individual reward sequences. The hierarchical model will provide more robust estimates by leveraging the group data.
+
+### Choice Distribution
+
+To investigate whether participants exhibited an overall **preference** for one option regardless of recent outcomes, we can analyze the distribution of **choice proportions** across subjects.
+
+If choices were purely driven by value learning, we would expect the average selection rates of each option to vary over time (i.e. over trial), but not consistently favor one side across participants. 
+
+We can examine whether participants exhibited a **systematic bias** toward one option by computing the proportion of choices made to each option ($1$ = Left, $2$ = Right) across all subjects.
+
+
+```{r choices by subject, echo=FALSE}
+
+rl_data$c <- factor(rl_data$c)
+
+# Calculate the proportion of each choice for each subject
+rl_choice_proportions <- rl_data %>%
+  group_by(name, c) %>%
+  summarise(count = n(), .groups = 'drop') %>%
+  group_by(name) %>%
+  mutate(proportion = count / sum(count))
+
+all_subject_ids <- unique(rl_choice_proportions$name)
+x_axis_breaks <- all_subject_ids[seq(1, length(all_subject_ids), by = 6)]
+
+# Plotting individual choice proportions
+ggplot(rl_choice_proportions, aes(x = factor(name), y = proportion, fill = c)) +
+  geom_bar(stat = "identity") +
+  labs(
+    title = "Individual Subject Choice Proportions",
+    x = "Subject",
+    y = "Proportion of Choices",
+    fill = "Choice"
+  ) +
+  scale_fill_manual(values = c("1" = "#BAD4E6", "2" = "steelblue")) +
+  scale_x_discrete(breaks = x_axis_breaks) + 
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle =  45, hjust = 1, size = 8)) 
+```
+
+
+The stacked bar chart visually represents the proportion of times each participant selected *Choice 1* (Left) versus *'Choice 2'* (Right) across all trials. Each vertical bar corresponds to a unique subject, and the height of the colored segments within the bar indicates the relative frequency of each choice for that specific individual.
+
+Rather than a uniform distribution of choices (e.g., $50/50$ split), we observe a **spectrum of preferences**. Such clear visual evidence of **individual choice biases** strongly supports the model's design, particularly the design of a subject-specific models, and the inclusion of an individual **intercept term**, to which we will refer as bias, or $b_0$. A positive $b_0$ would indicate a bias towards the "default" choice, while a negative $b_0$ would suggest a bias towards the alternative choice. 
+
+### Choice Preservation
+
+Human decision-making is often more complex than just a static, unconditional bias. Participants don't always restart their decision process anew on every trial, solely driven by learned values and a fixed baseline preference. Instead, their **previous actions** can exert an **influence** on their **current decision**, as emerges from the visualization below, which highlights the group-level probabilities
+$$\mathbb{P}(c_{t+1}=x|c_t = 1)$$
+$$\mathbb{P}(c_{t+1}=x|c_t = 2)$$
+
+
+
+```{r stickiness visualization, echo = FALSE}
+library(dplyr)
+
+# 1. Create a 'previous_choice' column for each subject
+rl_data_with_prev_choice <- rl_data %>%
+  group_by(name) %>%
+  mutate(previous_choice = lag(c)) %>% # `lag()` gets the value from the previous row within each group
+  ungroup()
+
+# 2. Filter out the first trial of each subject (where previous_choice is NA)
+rl_transitions <- rl_data_with_prev_choice %>%
+  filter(!is.na(previous_choice)) %>%
+  mutate(
+    current_choice = factor(c),
+    previous_choice = factor(previous_choice)
+  )
+
+# 3. Calculate the conditional probabilities (proportions)
+rl_conditional_probs <- rl_transitions %>%
+  group_by(previous_choice, current_choice) %>%
+  summarise(count = n(), .groups = 'drop_last') %>% # .groups = 'drop_last' ensures proportion calculation is correct
+  mutate(proportion = count / sum(count)) %>%
+  ungroup()
+
+# 4. Plotting the conditional probabilities
+ggplot(rl_conditional_probs, aes(x = previous_choice, y = proportion, fill = current_choice)) +
+  geom_bar(stat = "identity", position = "dodge") + # 'dodge' separates bars side-by-side
+  labs(
+    title = "Conditional Probability of Current Choice Given Previous Choice",
+    x = "Previous Choice",
+    y = "Proportion of Current Choice",
+    fill = "Current Choice"
+  ) +
+  scale_fill_manual(values = c("1" = "#F5C7DC", "2" = "#C2A5C9")) +
+  theme_minimal() +
+  # Add text labels for the proportions on top of the bars for clarity
+  geom_text(aes(label = sprintf("%.2f", proportion)),
+            position = position_dodge(width = 0.9), vjust = -0.5, size = 3)
+```
+
+On average, the conditional probability of choosing the same option as the previous one is always higher then the alternative.
+
+Such phenomenon of **choice preservation** is known as **stickiness*, and as the plot shows, it emerges even at the group-level: subjects tend to be conditioned by their previous decision when performing the current one.
+
+Stickiness directly models a **conditional probability** – specifically, the probability of making a certain choice at trial $t+1$, given the choice made at trial $t$: $$\mathbb{P}(\text{choice}_{t+1}|\text{choice}_t)$$
+
+To take this observation into account, the enhanced model (M3) is fitted with this additional parameter, which was created according to the definition:
+$$
+\text{stick}_{t+1}=\cases{+ 0.5 \quad \text{  if }c_{t+1}=\text {left }\\ -0.5\quad \text{ if } c_{t+1} = \text{ right}}
+$$
+
+
+
+# Methods and Models
+
+This project applies a **model-based Bayesian approach** to analyze human decision-making in a reinforcement learning (RL) task. We implement and compare three variants of the **Q-learning model**, designed to capture how participants learn from reward feedback and make binary choices. All models are implemented in **JAGS** and estimated via **Markov Chain Monte Carlo (MCMC)** using the `R2jags` interface in R.
+
+At the core of Q-learning is the **action-value function** $Q_{s,t}(c)$, which represents the expected reward for taking choice $c \in \{1=\text{ left }, 2 =\text{right}\}$ at trial $t$ for subject $s$. These Q-values are initialized at $0.5$ and updated after each trial using a **prediction error**:
+
+$$
+Q_{s,t+1}(c) = Q_{s,t}(c) + \alpha_s \cdot \delta_{s,t}
+\quad\text{where}\quad
+\delta_{s,t} = R_{s,t} - Q_{s,t}(c)
+$$
+
+Here, $R_{s,t}$ is the reward received at trial $t$, and $\alpha_s$ is the **learning rate**, controlling how strongly prediction errors influence future expectations.
+
+To model choice behavior, we define the **probability of choosing left** as a logistic function of the **value difference** $\Delta Q_{s,t}$ between the two actions:
+
+$$
+\Delta Q_{s,t} = Q_{s,t}(1) - Q_{s,t}(2)
+$$
+
+The choice probability is then:
+
+$$
+\theta_{s,t} = \text{logit}^{-1}(\beta_{0,s} + \beta_{1,s} \cdot \Delta Q_{s,t})
+= \frac{1}{1 + \exp(-\beta_{0,s} - \beta_{1,s} \cdot \Delta Q_{s,t})}
+$$
+
+Where:
+
+* $\beta_{0,s}$ is a **bias term**, representing a subject’s baseline preference for the left option;
+* $\beta_{1,s}$ is the **inverse temperature**, reflecting the degree of stochasticity in decision-making: high values lead to more deterministic choices based on $\Delta Q$, while low values lead to more random responses.
+
+The **observed choice** for a subject $s$ at trial $t$ is modeled as:
+
+$$
+\text{c}_{s,t} \sim \text{Bernoulli}(\theta_{s,t})
+$$
+
+here $\theta_{s,t} = \mathbb{P}(c_{s,t} = 1)$ is governed by the former logistic function of the Q-value difference.
+
+
+#### Likelihood for a Single Choice
+The probability of observing a single choice $c_{s,t}$ for subject s at trial t is given by the Bernoulli probability mass function:
+
+$$P(c_{s,t} | \alpha_s, \beta_{0,s}, \beta_{1,s}, Q_{s,t}(1), Q_{s,t}(2), R_{s,t}) = \theta_{s,t}^{c_{s,t}} (1 - \theta_{s,t})^{1 - c_{s,t}}$$
+#### Total Likelihood for the Dataset
+The total likelihood for the entire dataset, assuming choices are conditionally independent given the parameters, is the product of the likelihoods for all individual choices:
+
+$$L(\text{data} | \alpha, \beta_0, \beta_1) = \prod_{s=1}^{205} \prod_{t=1}^{100} P(c_{s,t} | \alpha_s, \beta_{0,s}, \beta_{1,s}, Q_{s,t}(1), Q_{s,t}(2), R_{s,t})$$
+
+This probabilistic formulation allows us to estimate each subject’s learning and decision parameters based on their observed behavior. The Bayesian framework supports full posterior inference and naturally extends to hierarchical structures to capture individual differences in cognitive strategies.
+
+To prepare the dataset for Bayesian modeling in JAGS, we reshaped the trial-level data into **subject-by-trial** matrices ($205 \times 100$ dimensions), by looping over each trial for each subject and populating the matrices accordingly.
+
+The key objects created and passed to the JAGS model via the `data_jags` list include:
+
+* `trialNum_Gershman`: A vector indicating the total number of trials for each subject.
+* `reward_Gershman`$_{i,j}$: Binary reward (1 or 0) received by the $i^{th}$ subject on the $j^{th}$ trial.
+* `state_Gershman`$_{i,j}$: Stimulus identifier (1–4) presented to the $i^{th}$ subject on the $j^{th}$ trial.
+* `choice_Gershman`$_{i,j}$: Original choice (1 = left, 2 = right) made by the $i^{th}$ subject on the $j^{th}$ trial.
+* `choice_two_Gershman`$_{i,j}$: Binarized choice (1 = left, 0 = right) derived from `choice_Gershman`, used as the dependent variable for softmax regression.
+* `stickiness_Gershman`$_{i,j}$:  variable representing the influence of the previous choice. It is set to 0.5 if the $i^{th}$ subject's previous choice was left, and -0.5 if the previous choice was right. For the first trial of each subject, this value is set to 0, as there is no preceding choice.
+
+These prepared matrices, along with constants like the number of subjects and trials, form the `data_jags` object for the JAGS inference. Full preprocessing code is available in the supplementary script `preprocessing.R`.
+
+## Model 1: Non-Hierarchical Q-Learning
+
+Model 1 (defined in `Non_hierarchicalM1.txt`) serves as the **baseline**, assuming that all subjects share the same cognitive parameters. A single learning rate $\alpha$, bias $\beta_0$, and inverse temperature $\beta_1$ are used for all participants.
+
+Choices are modeled using a **Q-learning rule** with a **single set of parameters**: For each subject $s$ we derive the Q-value at trial $t+1$ given choice $c\in\{1,0\}$ as a function of the previous Q-value:
+
+$$
+Q_{t+1}(s,c) = Q_t(s,c) + \alpha \cdot (r_t - Q_t(s,c))
+$$
+
+The probability of choosing the left option is governed by a logistic function of the Q-value difference:
+
+$$
+\theta_{s,t} = \text{logit}^{-1}(\beta_0 + \beta_1 \cdot \Delta Q_{s,t})
+$$
+
+This model ignores individual differences, providing a benchmark against which the hierarchical extensions (Models 2 and 3) can be evaluate, and specifies group-level hyperpriors as follows: 
+
+$$
+\begin{aligned}
+&\alpha \sim \text{Beta}(2,2)  \quad \text{ shared learning rate}\\\\
+& \beta_0 \sim \mathcal{N}(0, 100) \quad \text{ shared bias} \\\\
+& \beta_1 \sim \mathcal{N}(0, 100) \quad \text{ shared inverse temperature}
+
+\end{aligned}
+$$
+
+where a Beta prior distribution is placed over the learning rate to ensure it is constrained in $[0,1]$, while being weakly informative and the weakly informative normal prior centered at $0$ for the $\beta$s are a common choice for parameters on the logit scale (e.g., softmax) since they allow both positive and negative values with a wide spread (for jags, we specify precision = 0.01).
+
+```{r M1}
+load("model_M1.RData")
+model_M1$model
+```
+
+
+## Model 2: Hierarchical Q-Learning
+
+Model 2 extends the baseline (Model 1) by allowing individual differences through a **hierarchical structure**. Each subject $s$ is assumed to have their own parameters:
+
+* a learning rate $\alpha_s$,
+* a bias $\beta_{0,s}$,
+* and an inverse temperature $\beta_{1,s}$,
+
+drawn from group-level distributions.
+
+The full prior specification is:
+
+
+$$
+\begin{aligned}
+&\alpha_s \sim \text{Beta}(\tau_1, \tau_2), \quad \tau_1, \tau_2 \sim \mathcal{C}^+(0, 5^2) \\\\
+&\boldsymbol{\beta}_s = 
+\begin{pmatrix}
+\beta_{0,s} \\\\
+\beta_{1,s}
+\end{pmatrix}
+\sim \mathcal{N}_2(\boldsymbol{\mu}_\beta, \Sigma_\beta), \quad
+\boldsymbol{\mu}_\beta =
+\begin{pmatrix}
+\mu_0 \\\\
+\mu_1
+\end{pmatrix}, \quad \mu_i \sim \mathcal{N}(0, 25^{-2}) \\\\
+&\Sigma_\beta = \Lambda \cdot \Omega \cdot \Lambda, \quad
+\Lambda = \text{diag}(\lambda_0, \lambda_1), \quad
+\lambda_i \sim \mathcal{N}^+(0, 25^{-2}) \\\\
+&\text{Corr}(\beta_0, \beta_1) = \rho_{01}, \quad 
+\rho_{01} \sim \text{Uniform}(-1, 1)
+\end{aligned}
+$$
+As illustrated in Figure 1, this modeling framework captures the full hierarchical structure: individual-level parameters are drawn from group-level distributions, which in turn are governed by hyperparameters.
+
+```{r fig-hierarchy, echo=FALSE, out.width="70%", fig.align="center"}
+knitr::include_graphics("R.jpg")
+```
+
+
+
+```{r M2}
+load("model_M2.RData")
+model_M2$model
+```
+
+---
+
+## Model 3: Hierarchical Q-learning with Stickiness
+
+To better capture the cognitive dynamics underlying individual decision-making, **Model 3 (M3)** extends the previous hierarchical Q-learning model by adding a **stickiness parameter** $\kappa$. This addition allows us to model each subject’s tendency to **repeat previous choices**, regardless of the observed outcome.
+
+As in Model 2, we still allow for **subject-specific parameters** and **hierarchical pooling** through group-level hyperparameters, but we now estimate three parameters per subject:
+
+* $\alpha_s$: the **learning rate**, governing how strongly prediction errors update value estimates;
+* $\beta_{1,s}$: the **inverse temperature**, controlling sensitivity to value differences;
+* $\beta_{0,s}$: the **baseline choice bias**;
+* $\kappa_s$: the **stickiness parameter**, quantifying the effect of the previous choice on the current one.
+
+The parameter $k$ is meant to capture the effect of stickiness, since it scales the influence of action repetition on the current choice probability. A positive value of $k$ implies a bias toward repeating left choices, whereas a negative value favors repetition of right choices.
+
+These are modeled hierarchically:
+
+$$
+\begin{aligned}
+\alpha_s &\sim \text{Beta}(\tau_1, \tau_2) \\
+\boldsymbol{\beta}_s = 
+\begin{bmatrix}
+\beta_{0,s} \\
+\beta_{1,s} \\
+\kappa_s
+\end{bmatrix}
+&\sim \mathcal{N}_3(\boldsymbol{\mu}_\beta, \Sigma_\beta)
+\end{aligned}
+$$
+
+The covariance matrix $\Sigma_\beta$ is estimated using a weakly informative inverse-Wishart prior on its **precision** $\tau_\beta$, allowing for possible correlations between $\beta_0$, $\beta_1$, and $\kappa$ across individuals:
+
+$$
+\tau_\beta \sim \text{Wishart}(R, \nu), \quad \Sigma_\beta = \tau_\beta^{-1}
+$$
+
+---
+
+#### Softmax Choice Rule with Stickiness
+
+Incorporating stickiness into the choice model, the softmax function becomes:
+
+$$
+\text{logit}(p_{s,t}) = \beta_{0,s} + \beta_{1,s} \cdot \left(Q_{s,t}(1) - Q_{s,t}(2)\right) + \kappa_s \cdot \text{stick}_{s,t}
+$$
+
+Here:
+
+* $Q_{s,t}(a)$ is the estimated value of action $a$ at time $t$ for subject $s$,
+* $\text{stick}_{s,t} \in {-0.5, +0.5}$ encodes whether the subject repeated their previous choice,
+* The parameter $\kappa_s$ **increases the likelihood of repeating the previous action when positive**.
+    - If $k > 0$, it means subjects are more likely to repeat the left choice.
+    - If $k < 0$, it indicates a tendency to repeat the right choice.
+    - If $k \approx 0$, no stickiness bias is detected.
+    
+    
+```{r M3 fig-hierarchy, echo=FALSE, out.width="70%", fig.align="center"}
+knitr::include_graphics("R3.jpg")
+```
+
+```{r M3}
+load("model_M3.RData")
+model_M3$model
+```
+
+---
+
+# Inferential Findings
+
+
+## Model 1 - Analysis
+
+Model 1 was estimated using $3$ MCMC chains with $5,000$ iterations each ($1,000$ burn-in), yielding $7,500$ posterior samples.
+
+
+```{r M1 fit, eval = FALSE}
+library(R2jags)
+
+params <- c("alpha", "b0", "b1", "choice_pred")
+
+data12 <- list("NS" = 205,
+             "MT" = 100,
+             "NStim" = 4,
+             "NC" = 2,
+             "NT" = trialNum_Gershman,
+             "stim_id" = state_Gershman,
+             "rew" = reward_Gershman,
+             "choice" = choice_Gershman, 
+             "choice_two" = choice_two_Gershman)
+
+
+model_M1 <- jags(data = data12,
+                   parameters.to.save = params,
+                   model.file = "Non_hierarchicalM1.jags",
+                   n.chains = 3,
+                   n.iter = 5000,
+                   n.burnin = 1000,
+                   n.thin = 3)
+
+```
+
+
+From the output of the jags model we can directly assess our posterior point and interval summaries as follows:
+
+```{r m1 summary, echo=FALSE}
+# Extract posterior summary
+library(knitr)
+
+summary_m1 <- as.data.frame(model_M1$BUGSoutput$summary)
+params_of_interest <- c("alpha", "b0", "b1")
+
+# Create a summary table with 95% credible intervals
+ci_table <- summary_m1[params_of_interest, c("mean", "sd", "2.5%", "97.5%", "Rhat", "n.eff")]
+
+# Rename columns for clarity in the final table
+colnames(ci_table) <- c("Posterior Mean", "Posterior SD", "Lower 95% CI", "Upper 95% CI",
+                       "Rhat", "ESS" )
+ci_table <- round(ci_table, 3)
+
+# Generate the clean table
+kable(ci_table, caption = "Point Estimates and 95% CI for Model Parameters (Alpha, b0, b1)")
+print(c("M1 DIC: ", model_M1$BUGSoutput$DIC))
+```
+
+### M1 Convergence diagnostic 
+
+Before delving deeper in the analysis, we must assess wheather the model has convergenced:
+
+- The model **converged** well, as indicated by the **Gelman–Rubin** $\hat{R} \approx 1.00$ for all parameters. This strongly indicates that the MCMC chains for $\alpha$, $b_0$, and $b_1$ have mixed well and converged to the same target posterior distribution. We can trust that the samples from the different chains are providing consistent estimates of the posterior.
+
+- The **Deviance Information Criterion (DIC)** is 25991.4
+
+- The **n.eff** values are quite large. This indicates we have a sufficient number of independent samples to obtain reliable and stable estimates of your posterior means, standard deviations, and credible intervals.
+
+- We can visualize **trace plot** of the sampled values of each parameter against the iteration number for all chains:
+
+```{r traceplots M1, echo=FALSE, waring = FALSE, fig.width=10, fig.height=10 }
+library(coda)
+library(R2jags)
+library(bayesplot) 
+library(ggplot2)
+
+raw_sims_array <- model_M1$BUGSoutput$sims.array
+
+available_param_names <- dimnames(raw_sims_array)[[3]]
+
+# convert the raw sims.array into an mcmc.list object
+mcmc_samples_list <- list()
+n_chains <- dim(raw_sims_array)[2] # Number of chains
+
+for (chain_idx in 1:n_chains) {
+  # Extract data for the current chain across all parameters and iterations
+  # Result will be a matrix: [iterations, parameters]
+  chain_matrix <- raw_sims_array[, chain_idx, ]
+  mcmc_samples_list[[chain_idx]] <- mcmc(chain_matrix)
+}
+mcmc_samples <- as.mcmc.list(mcmc_samples_list)
+
+
+params_to_plot_desired <- c("alpha", "b0", "b1", "deviance")
+params_to_plot_actual <- intersect(params_to_plot_desired, available_param_names)
+
+mcmc_trace(mcmc_samples, pars = params_to_plot_actual)
+
+```
+For all parameters, the visualization reassures us of good mixing 
+
+
+```{r m1 autocorrelation plot , echo = FALSE, fig.height= 8, cache=TRUE}
+library(R2jags)
+library(ggplot2) 
+library(dplyr)   # For data manipulation
+library(tidyr)   # For data manipulation
+library(patchwork) # For combining plots
+
+
+# 1. Extract MCMC Samples as a 3D array
+# Dimensions: [Iterations, Chains, Parameters]
+mcmc_samples_array <- model_M1$BUGSoutput$sims.array
+
+# 2. Define parameters for which to plot ACF
+parameters_to_plot <- c("alpha", "b0", "b1")
+
+# 3. Prepare an empty data frame to store all ACF results
+# We'll collect Lag, ACF value, Parameter name, and Chain number
+all_acf_data <- data.frame(
+  Lag = numeric(),
+  ACF = numeric(),
+  Parameter = character(),
+  Chain = character()
+)
+
+# 4. Loop through each parameter and each chain to calculate ACF
+num_chains <- dim(mcmc_samples_array)[2]
+num_iterations_per_chain <- dim(mcmc_samples_array)[1] # Number of post-burnin, post-thin iterations
+
+# Approximate 95% confidence interval for autocorrelation (for significance lines)
+# This is typically 2 / sqrt(N), where N is the number of samples in the series.
+ci_bound <- 2 / sqrt(num_iterations_per_chain)
+
+for (param_name in parameters_to_plot) {
+  for (chain_idx in 1:num_chains) {
+    
+    # Extract the vector of samples for the current parameter and chain
+    # Ensure it's treated as a vector (it should be automatically)
+    param_samples_vector <- mcmc_samples_array[, chain_idx, param_name]
+    
+    # Calculate the AutoCorrelation Function (ACF)
+    # plot=FALSE prevents acf() from drawing a plot automatically
+    # lag.max can be adjusted, e.g., to 50 or floor(length(param_samples_vector)/2)
+    acf_result <- acf(param_samples_vector, plot = FALSE, lag.max = 50) 
+    
+    # Extract Lag and ACF values
+    acf_df <- data.frame(
+      Lag = acf_result$lag,
+      ACF = acf_result$acf
+    )
+    
+    # Add Parameter and Chain information
+    acf_df$Parameter <- param_name
+    acf_df$Chain <- paste0("Chain ", chain_idx)
+    
+    # Bind to the main data frame
+    all_acf_data <- rbind(all_acf_data, acf_df)
+  }
+}
+
+# Convert Chain to a factor for proper plotting
+all_acf_data$Chain <- as.factor(all_acf_data$Chain)
+
+# 5. Generate ggplot2 plots
+plot_list <- list()
+
+for (param_name in parameters_to_plot) {
+  # Filter data for the current parameter
+  current_param_data <- all_acf_data %>%
+    filter(Parameter == param_name)
+  
+  p <- ggplot(current_param_data, aes(x = Lag, y = ACF, color = Chain)) +
+    geom_hline(yintercept = 0, color = "gray50", linetype = "dashed") +
+    # Draw segments from y=0 to the ACF value for a bar-like plot
+    geom_segment(aes(xend = Lag, yend = 0), size = 0.8) +
+    geom_point(size = 2) +
+    # Add approximate 95% confidence interval lines
+    geom_hline(yintercept = ci_bound, linetype = "dotted", color = "red") + 
+    geom_hline(yintercept = -ci_bound, linetype = "dotted", color = "red") + 
+    labs(title = paste("Autocorrelation Function for", param_name),
+         x = "Lag", y = "Autocorrelation") +
+    theme_minimal() +
+    scale_color_brewer(palette = "Blues") + # Use a color palette for chains
+    theme(legend.position = "bottom",
+          plot.title = element_text(size = 10)) # Adjust title size for combining
+  
+  plot_list[[param_name]] <- p
+}
+
+combined_acf_plots <- wrap_plots(plot_list, ncol = 1)
+print(combined_acf_plots)
+
+
+```
+
+### M1 Posterior Predictive Checks
+To evaluate the adequacy of the non hierarchical reinforcement learning model (M2), we performed posterior predictive checks (PPCs). These checks assess whether the model can reproduce key aspects of the observed behavior. Specifically, we used the **posterior means** of each subject’s parameters—learning rate $\alpha_s$ and choice coefficients $\beta_{0,s}$ and $\beta_{1,s}$—to **simulate new choice trajectories based on the model’s generative process**.
+
+We then compared these simulated choices to the actual observed data (e.g., the proportion of left choices across trials) to determine whether the model captures the structure and variability present in human decisions. A good fit would imply that the model is capable of replicating empirical behavior and thus provides a meaningful account of the learning and decision-making processes.
+
+```{r PCC M1, echo=FALSE, warning=FALSE}
+library(bayesplot)
+library(ggplot2)
+load("choice_two_Gershman.RData")
+
+# --- Define Dimensions ---
+NS_original <- 205 # Total number of subjects
+NT_original <- 100 # Total trials per subject in your raw 'choice_two' data
+NT_modeled <- NT_original - 1 # This will be 99 (trials 2-100 are 99 trials)
+
+# --- 1. Prepare the Data for bayesplot ---
+
+# Access the raw sims.array from your R2jags output
+raw_sims_array <- model_M1$BUGSoutput$sims.array
+
+# Get parameter names and find 'choice_pred' indices
+param_names_in_sims_array <- dimnames(raw_sims_array)[[3]]
+choice_pred_logical_indices <- grepl("^choice_pred\\[", param_names_in_sims_array)
+
+# CRITICAL SANITY CHECKS
+expected_elements <- NS_original * NT_modeled
+found_elements <- sum(choice_pred_logical_indices)
+
+if (found_elements == 0) {
+  stop("Error: No 'choice_pred' parameters with indices (e.g., choice_pred[s,t]) found in model output. Please check your model's 'parameters.to.save' in JAGS or the exact naming convention in the sims.array.")
+} else if (found_elements != expected_elements) {
+  stop(paste0("CRITICAL DIMENSION MISMATCH: Expected ", expected_elements, " 'choice_pred' elements (NS * (NT-1)), but found ", found_elements, ". Please verify your NS_original, NT_original, and how 'choice_pred' is defined/saved in your JAGS model."))
+}
+
+# Extract the relevant simulated data as a flat vector first
+sims_for_choice_pred_values <- as.vector(raw_sims_array[, , choice_pred_logical_indices])
+
+# Determine total number of draws (iterations * chains)
+n_total_draws <- dim(raw_sims_array)[1] * dim(raw_sims_array)[2]
+
+yrep_all_draws_reshaped <- array(
+  data = sims_for_choice_pred_values,
+  dim = c(n_total_draws, NS_original, NT_modeled)
+)
+
+# Flatten observed data (y)
+y_obs_flat <- as.vector(choice_two_Gershman[, 2:NT_original])
+
+# Final verification
+if (length(y_obs_flat) != NS_original * NT_modeled) {
+  stop("Final Data Mismatch: Flattened observed data 'y_obs_flat' does not match the expected number of modeled data points after subsetting. This indicates an issue with 'choice_two' dimensions or original 'NT_original' definition.")
+}
+
+# --- 2. Generate PPC Plots ---
+
+# PPC Plot A: Overall Mean Choice Proportion 
+# **************************************************************************
+
+# 1. Calculate the overall mean for EACH posterior predictive draw.
+# This results in a vector of length 'n_total_draws'.
+yrep_overall_means_vector <- apply(yrep_all_draws_reshaped, MARGIN = 1, FUN = mean)
+
+# 2. Convert this vector into a 1-column matrix, as required by ppc_stat's 'yrep' argument.
+yrep_overall_means <- matrix(yrep_overall_means_vector, ncol = 1)  LINE
+
+# 3. Calculate the overall mean of your observed data (a single value).
+obs_overall_mean <- mean(y_obs_flat)
+
+# 4. Create the plot using ppc_stat with stat = "identity".
+plot_overall_mean <- ppc_stat(
+  y = obs_overall_mean,          # Pass the single observed mean
+  yrep = yrep_overall_means,     # Pass the 1-column matrix of simulated means
+  stat = "identity",             # Tells bayesplot that 'yrep' already *is* the statistic
+  binwidth = 0.0005
+) +
+  ggtitle("PPC: Overall Mean Choice Proportion (Trials 2-100)") +
+  xlab("Mean Choice (Proportion of 1s)") +
+  theme_minimal()
+print(plot_overall_mean)
+
+```
+
+The histograms shows the **posterior predictive distribution** of the overall mean choice proportion. It represents the range of overall mean choice proportions that Model M1, with its estimated parameters, expects to see if you were to generate new data.
+
+The observed mean (vertical line) falls almost perfectly in the center and highest density region of the histogram (simulated means).
+
+```{r ppc m1 plot b , echo=FALSE}
+library(coda)
+
+# PPC Plot B: Distribution of Mean Choice Proportion Per Subject
+# Calculate observed mean choice for each subject
+obs_subj_means <- rowMeans(choice_two_Gershman[, 2:NT_original])
+
+# Calculation for YREP_SUBJ_MEANS (This is good, keeps matrix [n_total_draws, NS_original])
+yrep_subj_means <- t(apply(
+  X = yrep_all_draws_reshaped,
+  MARGIN = 1, # Apply function to each slice along the first dimension (draws)
+  FUN = function(draw_data_slice) {
+    # draw_data_slice will be a matrix of [NS_original, NT_modeled]
+    rowMeans(draw_data_slice) # Returns a vector of length NS_original
+  }
+))
+
+
+plot_subj_means_density <- ppc_dens_overlay(
+  y = obs_subj_means,
+  yrep = yrep_subj_means[sample(1:n_total_draws, size = min(500, n_total_draws), replace = FALSE), , drop = FALSE],
+  alpha = 0.1
+) +
+  ggtitle("PPC: Distribution of Subject-Level Mean Choice Proportions (Trials 2-100)") +
+  xlab("Mean Choice Proportion Per Subject") +
+  theme_minimal()
+print(plot_subj_means_density)
+
+```
+
+
+This PPC for Model M1 shows its excellent ability to capture the distribution of individual differences in mean choice proportions. The thick dark blue line (observed data) aligns very well with the cluster of light blue lines (model simulations), indicating M1 accurately, but not excellently, reproduces the **variability and shape of average choice behavior across subjects**.
+
+### M1 Results
+Now that we have assessed the posterior predictive power of the model, thus the reliability of its posterior estimates, we can answer to the main questions emerged while exploring the dataset:
+
+- **Q.1 Is learning happening at all?**
+
+  Model 1 provides a group-level answer, steaming from the oversimplification of adopting one common cognitive Q-model for all subjects.
+
+  We can address and quantify this question by Hypothesis Testing:
+$$\mathbb{H}_0 \quad \alpha = 0 \quad\text{ (no learning)     vs }\quad  \mathbb{H}_1:\quad \alpha > 0\quad \text{(learning)}$$
+  
+```{r }
+  mean(model_M1$BUGSoutput$sims.list$alpha > 0)
+```
+The learning rate $\alpha$ is always non zero, implying the subjects learn trial by trial.
+
+- **Q.2 Are the subjects learning fast?**
+  Hypothesis: $$\mathbb{H}_0:\quad \alpha \leq 0.5\quad \text{ vs } \quad \mathbb{H}_1: \quad \alpha > 0.5$$
+
+```{r}
+mean(model_M1$BUGSoutput$sims.list$alpha > 0.5)
+```
+
+The conclusion does not support the hypothesis, implying the learning is on average very slow
+
+- **Q.3 Is there choice sensitivity ?** (inverse temperature > 0)
+
+Hypothesis: $$\mathbb{H}_0:\quad \beta_1 = 0 \quad \text{(completely random choice )      vs   }\quad \mathbb{H}_1: \beta_1 > 0$$
+
+```{r}
+# choice sensitivity ht
+mean(model_M1$BUGSoutput$sims.list$b1 > 0)
+```
+
+$\beta_1$ is clearly above 0, which means participants are more likely to choose higher-valued options — a key marker of rational behavior under reinforcement learning.
+
+- **Q.4 Is there a side bias?** (intercept $\neq$ 0)
+Hypothesis: $$\mathbb{H}_0:\quad \beta_0 = 0 \quad\text{ (no bias toward left/right)   vs    }\quad \mathbb{H}_1:\quad \beta_0 \neq 0$$
+
+```{r}
+# side bias ht
+mean(model_M1$BUGSoutput$sims.list$b0 > 0)
+```
+
+
+We find strong evidence that group-level learning occurred, possibly quite slow, with $\Pr(\alpha > 0) = 1.000$ and $\Pr(\alpha > 0.5) = 0.234$.
+
+Moreover, the inverse temperature parameter $\beta_1$ shows high posterior support for value-based choice behavior, with $\Pr(\beta_1 > 0) = 1.000$ and a $95%$ CI of $[1.64, 1.89]$.
+
+The intercept $\beta_0$ appears close to zero, having a $95%$ CI  $\approx[0, 0.057]$ suggesting little to no group-level systematic side bias. However, this result is likely driven by the non-hierarchical structure of the model, which constrains all subjects to share the same bias parameter. In reality, individual subjects may have different personal preference for each side, but these differences are averaged out in this model.
+
+A more flexible hierarchical model (Model 2) allows individual-level estimation of $\beta_0$, and is therefore better suited to capturing such heterogeneity.
+
+## Model 2 - Analysis
+
+We can extend the former analysis on the subject level deploying the hierarchical M2 formulation and provide insight into how the parameters are distributed within the sampled population. 
+Model 1 was estimated using $3$ MCMC chains with $5,000$ iterations each ($1,000$ burn-in).
+
+```{r M2 fit, eval = FALSE, fig.height= 6, cache=TRUE}
+params <- c("alpha", "beta", "betaG", "lambda", "rho", "choice_pred")
+model_M2 <- jags(data = data12,
+                 parameters.to.save = params,
+                 model.file = "Hierarchical_M2.jags",
+                 n.chains = 3,
+                 n.iter = 5000,
+                 n.burnin = 1000,
+                 n.thin = 3)
+```
+
+### M2 Convergence Diagnostic
+
+To provide a primary evidence for the overall convergence and stability of the M2 MCMC model we might examine Rhat, neff, DIC and traceplots. Differently from the previous M1 model, we will now focus on deviance and hyperparameters' traceplots, in order to assess good mixing in group-level parameters.
+
+```{r M2 convergence, echo=FALSE}
+library(coda)
+library(R2jags)
+library(bayesplot) # For mcmc_trace
+library(ggplot2)   # bayesplot relies on ggplot2
+library(dplyr)     #
+
+plot_trace_and_diagnostics <- function(model_object, model_name = "Model") {
+
+  # Extract MCMC samples (all parameters)
+  raw_sims_array <- model_object$BUGSoutput$sims.array
+  available_param_names <- dimnames(raw_sims_array)[[3]]
+
+  # --- Dynamically select relevant parameters for diagnostics (group-level & deviance) ---
+  params_to_plot_for_diagnostics <- c() # Initialize as empty to build it up
+
+  # Always try to include deviance
+  if ("deviance" %in% available_param_names) {
+    params_to_plot_for_diagnostics <- c(params_to_plot_for_diagnostics, "deviance")
+  }
+
+  # Add group-level betaG components (e.g., "betaG[1]", "betaG[2]", "betaG[3]")
+  betaG_components <- grep("^betaG\\[", available_param_names, value = TRUE)
+  params_to_plot_for_diagnostics <- c(params_to_plot_for_diagnostics, betaG_components)
+
+  # Add group-level lambda components (e.g., "lambda[1]", "lambda[2]") - for models like M1
+  lambda_components <- grep("^lambda\\[", available_param_names, value = TRUE)
+  params_to_plot_for_diagnostics <- c(params_to_plot_for_diagnostics, lambda_components)
+
+  if ("rho" %in% available_param_names) {
+    params_to_plot_for_diagnostics <- c(params_to_plot_for_diagnostics, "rho")
+  }
+
+  # Add precision matrix components (tau_beta)
+  tau_beta_components <- grep("^tau_beta\\[", available_param_names, value = TRUE)
+  params_to_plot_for_diagnostics <- c(params_to_plot_for_diagnostics, tau_beta_components)
+
+  # Add covariance matrix components (SigmaG)
+  SigmaG_components <- grep("^SigmaG\\[", available_param_names, value = TRUE)
+  params_to_plot_for_diagnostics <- c(params_to_plot_for_diagnostics, SigmaG_components)
+  # **END NEW ADDITIONS**
+
+  # Add tau1, tau2 (beta distribution shape params) if they are estimated (not fixed)
+  if ("tau1" %in% available_param_names) {
+    params_to_plot_for_diagnostics <- c(params_to_plot_for_diagnostics, "tau1")
+  }
+  if ("tau2" %in% available_param_names) {
+    params_to_plot_for_diagnostics <- c(params_to_plot_for_diagnostics, "tau2")
+  }
+
+  # --- Check if any parameters were selected for diagnostics ---
+  if (length(params_to_plot_for_diagnostics) == 0) {
+    warning(paste0("No common group-level or diagnostic parameters (deviance, betaG, lambda, rho, tau_beta, SigmaG, tau1, tau2) found for ", model_name, ". Cannot generate traceplots or diagnostics table based on these parameters."))
+    # Still print DIC if available
+    dic_value <- model_object$BUGSoutput$DIC
+    if (!is.null(dic_value)) {
+      cat(paste0("\nDIC for ", model_name, ": ", round(dic_value, 2), "\n"))
+    } else {
+      cat(paste0("\nDIC for ", model_name, ": Not available (or not saved).\n"))
+    }
+    return(invisible(NULL)) # Exit function gracefully
+  }
+
+  # This makes the function robust if some 'expected' params aren't actually saved
+  actual_params_to_plot <- intersect(params_to_plot_for_diagnostics, available_param_names)
+
+  if (length(actual_params_to_plot) == 0) {
+      warning(paste0("No requested diagnostic parameters found in model_object for ", model_name, ". Skipping traceplots and diagnostics table."))
+      dic_value <- model_object$BUGSoutput$DIC
+      if (!is.null(dic_value)) {
+        cat(paste0("\nDIC for ", model_name, ": ", round(dic_value, 2), "\n"))
+      } else {
+        cat(paste0("\nDIC for ", model_name, ": Not available (or not saved).\n"))
+      }
+      return(invisible(NULL))
+  }
+
+  # Filter the raw array to include only the selected diagnostic parameters *before* converting to mcmc.list
+  raw_sims_array_filtered <- raw_sims_array[, , actual_params_to_plot, drop = FALSE]
+
+  # Convert the filtered raw sims.array into an mcmc.list object
+  mcmc_samples_diagnostic_list <- list()
+  n_chains <- dim(raw_sims_array_filtered)[2] # Use dimensions of the filtered array
+  for (chain_idx in 1:n_chains) {
+    chain_matrix_filtered <- raw_sims_array_filtered[, chain_idx, ]
+    mcmc_samples_diagnostic_list[[chain_idx]] <- mcmc(chain_matrix_filtered)
+  }
+  mcmc_samples_diagnostic <- as.mcmc.list(mcmc_samples_diagnostic_list)
+
+
+  # ----- Traceplots using mcmc_trace (from bayesplot) -----
+  if (length(actual_params_to_plot) > 1) {
+    p_trace <- mcmc_trace(mcmc_samples_diagnostic) +
+      ggtitle(paste("Traceplots for Key Parameters of", model_name)) +
+      theme_minimal(base_size = 10) +
+      facet_wrap(~ parameter, scales = "free_y", ncol = 2) # Arrange plots in 2 columns
+  } else {
+    p_trace <- mcmc_trace(mcmc_samples_diagnostic) +
+      ggtitle(paste("Traceplot for", actual_params_to_plot[1], "of", model_name)) +
+      theme_minimal(base_size = 10)
+  }
+  print(p_trace) # Display the plot
+
+  # ----- Gelman-Rubin diagnostic (calculate, but don't print raw output) -----
+  gelman_results <- gelman.diag(mcmc_samples_diagnostic, multivariate = FALSE)
+
+  # ----- Effective sample size (calculate, but don't print raw output) -----
+  neff_results <- effectiveSize(mcmc_samples_diagnostic)
+
+  # ----- DIC (kept as is) -----
+  dic_value <- model_object$BUGSoutput$DIC
+  if (!is.null(dic_value)) { # Check if DIC is actually available
+    cat(paste0("\nDIC for ", model_name, ": ", round(dic_value, 2), "\n"))
+  } else {
+    cat(paste0("\nDIC for ", model_name, ": Not available (or not saved).\n"))
+  }
+
+
+  # ----- Summary Table (only print this as the main diagnostic output) -----
+  summary_df <- data.frame(
+    Parameter = actual_params_to_plot,
+    Rhat = round(gelman_results$psrf[, 1], 3),
+    Rhat_UpperCI = round(gelman_results$psrf[, 2], 3),
+    n_eff = round(neff_results, 1)
+  )
+
+  cat(paste0("\nSummary diagnostics for ", model_name, ":\n"))
+  print(summary_df, row.names = FALSE)
+
+  invisible(summary_df) # Return the summary data frame invisibly
+}
+
+plot_trace_and_diagnostics(model_M2, "Model M2")
+
+```
+
+The traceplots for Model 2's parameters, including the learning rate and the choice parameters, indicate that all Markov chains are well-mixed. They exhibit good stationarity, with chains traversing the parameter space effectively and intermingling consistently, suggesting successful convergence to the posterior distributions.
+
+#### Autocorrelation
+
+```{r M2 autocorrelation, fig.height=11, echo =FALSE, cache=TRUE}
+
+library(R2jags)
+library(ggplot2) # For plotting
+library(dplyr)   # For data manipulation
+library(tidyr)   # For data manipulation
+library(patchwork) # For combining plots
+
+
+# 1. Extract MCMC Samples as a 3D array from model_M2
+# Dimensions: [Iterations, Chains, Parameters]
+mcmc_samples_array <- model_M2$BUGSoutput$sims.array
+
+# 2. Define ONLY the hyperparameters for which to plot ACF
+parameters_to_plot <- c("betaG", "lambda", "rho")
+
+# 3. Prepare an empty data frame to store all ACF results
+all_acf_data <- data.frame(
+  Lag = numeric(),
+  ACF = numeric(),
+  Parameter = character(),
+  Chain = character()
+)
+
+# 4. Loop through each hyperparameter and each chain to calculate ACF
+num_chains <- dim(mcmc_samples_array)[2]
+num_iterations_per_chain <- dim(mcmc_samples_array)[1] # Number of post-burnin, post-thin iterations
+
+# Approximate 95% confidence interval for autocorrelation (for significance lines)
+ci_bound <- 2 / sqrt(num_iterations_per_chain)
+
+for (param_name in parameters_to_plot) {
+  for (chain_idx in 1:num_chains) {
+  
+    
+    # Check if the parameter exists in the array's dimnames
+    if (param_name %in% dimnames(mcmc_samples_array)[[3]]) {
+      param_samples_vector <- mcmc_samples_array[, chain_idx, param_name]
+    } else {
+
+      matching_param_names <- grep(paste0("^", param_name, "(\\[.*\\])?$"), dimnames(mcmc_samples_array)[[3]], value = TRUE)
+      
+      if (length(matching_param_names) > 0) {
+          # If it's a multi-element parameter, loop through each element
+          for (element_name in matching_param_names) {
+              element_samples_vector <- mcmc_samples_array[, chain_idx, element_name]
+              
+              acf_result <- acf(element_samples_vector, plot = FALSE, lag.max = 50) 
+              acf_df <- data.frame(
+                Lag = acf_result$lag,
+                ACF = acf_result$acf
+              )
+              acf_df$Parameter <- element_name # Use the specific element name (e.g., "betaG[1]")
+              acf_df$Chain <- paste0("Chain ", chain_idx)
+              all_acf_data <- rbind(all_acf_data, acf_df)
+          }
+          next # Skip to next outer loop iteration after processing all elements
+      } else {
+          warning(paste("Parameter '", param_name, "' not found in MCMC samples. Skipping."))
+          next # Skip this parameter if not found
+      }
+    }
+    
+    acf_result <- acf(param_samples_vector, plot = FALSE, lag.max = 50) 
+    
+    acf_df <- data.frame(
+      Lag = acf_result$lag,
+      ACF = acf_result$acf
+    )
+    
+    acf_df$Parameter <- param_name
+    acf_df$Chain <- paste0("Chain ", chain_idx)
+    
+    all_acf_data <- rbind(all_acf_data, acf_df)
+  }
+}
+
+
+# Convert Chain and Parameter to factors for proper plotting
+all_acf_data$Chain <- as.factor(all_acf_data$Chain)
+all_acf_data$Parameter <- as.factor(all_acf_data$Parameter)
+
+
+# 5. Generate ggplot2 plots
+plot_list <- list()
+
+# Sort parameters for consistent plot order if needed
+unique_parameters <- unique(all_acf_data$Parameter)
+
+for (param_name in unique_parameters) {
+  current_param_data <- all_acf_data %>%
+    filter(Parameter == param_name)
+  
+  p <- ggplot(current_param_data, aes(x = Lag, y = ACF, color = Chain)) +
+    geom_hline(yintercept = 0, color = "gray50", linetype = "dashed") +
+    geom_segment(aes(xend = Lag, yend = 0), size = 0.8) +
+    geom_point(size = 2) +
+    geom_hline(yintercept = ci_bound, linetype = "dotted", color = "red") + 
+    geom_hline(yintercept = -ci_bound, linetype = "dotted", color = "red") + 
+    labs(title = paste("Autocorrelation Function for", param_name),
+         x = "Lag", y = "Autocorrelation") +
+    theme_minimal() +
+    scale_color_brewer(palette = "Blues") +
+    theme(legend.position = "bottom",
+          plot.title = element_text(size = 10))
+  
+  plot_list[[param_name]] <- p
+}
+
+# Combine and print plots using patchwork
+combined_acf_plots <- wrap_plots(plot_list, ncol = 1)
+print(combined_acf_plots)
+
+```
+
+### M2 Posterior Predictive checks
+
+Following M1 PPC, from a hierarchical model we expect an enhanced predictive capability, given by the advantage of modelling each subject cognitive strategy individually.
+
+```{r M2 PPC, echo = FALSE, warning=FALSE}
+library(coda)
+library(bayesplot) # Ensure bayesplot is loaded
+library(ggplot2) # Ensure ggplot2 is loaded
+
+load("model_M2.RData")
+load("choice_two_Gershman.RData") # Load if not already in session
+
+NS_original <- 205 # Total number of subjects
+NT_original <- 100 # Total trials per subject in your raw 'choice_two_Gershman' data
+NT_modeled <- NT_original - 1 # This will be 99 (trials 2-100 are 99 trials)
+
+
+mcmc_samples2 <- as.mcmc(model_M2)
+choice_pred_samples <- model_M2$BUGSoutput$sims.list$choice_pred
+
+
+## M2 ppc Data Preparation
+
+raw_sims_array2 <- model_M2$BUGSoutput$sims.array
+
+# Get parameter names and find 'choice_pred' indices
+param_names_in_sims_array <- dimnames(raw_sims_array2)[[3]]
+choice_pred_logical_indices <- grepl("^choice_pred\\[", param_names_in_sims_array)
+
+expected_elements <- NS_original * NT_modeled
+found_elements <- sum(choice_pred_logical_indices)
+
+if (found_elements == 0) {
+  stop("Error: No 'choice_pred' parameters with indices (e.g., choice_pred[s,t]) found in M2 model output.")
+} else if (found_elements != expected_elements) {
+  stop(paste0("CRITICAL DIMENSION MISMATCH in M2: Expected ", expected_elements, " 'choice_pred' elements, but found ", found_elements, "."))
+}
+
+# Extract the relevant simulated data as a flat vector first
+sims_for_choice_pred_values2 <- as.vector(raw_sims_array2[, , choice_pred_logical_indices])
+
+# Determine total number of draws (iterations * chains)
+n_total_draws <- dim(raw_sims_array2)[1] * dim(raw_sims_array2)[2]
+
+# Create the yrep_all_draws_reshaped array explicitly ---
+# This is your core M2 posterior predictive data: [total_draws, NS_original, NT_modeled]
+yrep_all_draws_reshaped2 <- array(
+  data = sims_for_choice_pred_values2,
+  dim = c(n_total_draws, NS_original, NT_modeled)
+)
+
+# Flatten observed data (y) - common for both M1 and M2
+y_obs_flat <- as.vector(choice_two_Gershman[, 2:NT_original])
+
+# Final verification for y_obs_flat (important check)
+if (length(y_obs_flat) != NS_original * NT_modeled) {
+  stop("Final Data Mismatch in M2: Flattened observed data 'y_obs_flat' does not match expected modeled points.")
+}
+
+
+# --- 2. Generate PPC Plots ---
+
+# PPC Plot A: Overall Mean Choice Proportion
+
+yrep_overall_means_M2_vector <- apply(yrep_all_draws_reshaped2, MARGIN = 1, FUN = mean)
+yrep_overall_means_M2 <- matrix(yrep_overall_means_M2_vector, ncol = 1) 
+
+# Calculate the single observed overall mean
+obs_overall_mean_M2 <- mean(y_obs_flat)
+
+# Plot using ppc_stat with stat = "identity"
+plot_overall_mean_M2 <- ppc_stat(
+  y = obs_overall_mean_M2,     # The single observed statistic
+  yrep = yrep_overall_means_M2, # The matrix of replicated statistics (one column)
+  stat = "identity",           # Tell bayesplot that yrep *is* the statistic
+  binwidth = 0.0005
+) +
+  ggtitle("PPC (M2): Overall Mean Choice Proportion (Trials 2-100)") + # Clarify for M2
+  xlab("Mean Choice (Proportion of 1s)") +
+  theme_minimal()
+print(plot_overall_mean_M2)
+
+
+# PPC Plot B: Distribution of Mean Choice Proportion Per Subject
+# ********************************************************************************
+# Calculate observed mean choice for each subject
+obs_subj_means <- rowMeans(choice_two_Gershman[, 2:NT_original])
+
+yrep_subj_means <- t(apply(
+  X = yrep_all_draws_reshaped2, # Use M2's reshaped data
+  MARGIN = 1, # Apply function to each slice along the first dimension (draws)
+  FUN = function(draw_data_slice) {
+    # draw_data_slice will be a matrix of [NS_original, NT_modeled]
+    rowMeans(draw_data_slice) # Returns a vector of length NS_original
+  }
+))
+
+
+plot_subj_means_density_M2 <- ppc_dens_overlay( # Use a distinct name for M2 plot
+  y = obs_subj_means,
+  # This sampling is key for memory efficiency and plot clarity for density overlays
+  yrep = yrep_subj_means[sample(1:n_total_draws, size = min(500, n_total_draws), replace = FALSE), , drop = FALSE],
+  alpha = 0.1
+) +
+  ggtitle("PPC (M2): Distribution of Subject-Level Mean Choice Proportions (Trials 2-100)") + # Clarify for M2
+  xlab("Mean Choice Proportion Per Subject") +
+  theme_minimal()
+print(plot_subj_means_density_M2)
+
+```
+
+Based on the Posterior Predictive Checks for mean choice proportions, we observe a clear progression in model fit. There is a noticeable improvement in how well the predicted distribution aligns with the observed distribution when moving from Model 1 to Model 2.
+
+###  M2 Results
+Following the convergence diagnostics and posterior predictive checks for Model 2 (M2) – which notably showed an improved fit compared to Model 1 in predicting subject-level choice proportions – we now turn to its inferential results. This section presents the posterior distributions of the key subject-level parameters estimated by M2: the learning rate, the intercept or bias, and the sensitivity to value differences (b). We first visualize the overall distribution of these parameters across subjects using histograms of their posterior means, followed by caterpillar plots that provide a more granular view of each individual's estimated parameter value and its associated 95% credible interval.
+
+```{r M2 point and interval estimates, echo=FALSE}
+# Posterior means per subject
+results_M2 <- model_M2$BUGSoutput
+alpha_subj <- apply(results_M2$sims.list$alpha, 2, mean)
+beta_samples <- model_M2$BUGSoutput$sims.list$beta # only saved beta
+b0_samples <- beta_samples[,,1]
+b1_samples <- beta_samples[,,2]
+b0_subj_mean <- apply(b0_samples, 2, mean)
+b1_subj_mean <- apply(b1_samples, 2, mean)
+
+
+# 95% CIs per subject
+alpha_ci <- apply(results_M2$sims.list$alpha, 2, quantile, probs = c(0.025, 0.975))
+b0_ci <- apply(b0_samples, 2, quantile, probs = c(0.025, 0.975))
+b1_ci <- apply(b1_samples, 2, quantile, probs = c(0.025, 0.975))
+
+```
+
+```{r ,echo = FALSE, warning=FALSE, message=FALSE, fig.height=9, fig.width=9}
+library(dplyr)
+library(ggplot2)
+library(patchwork)
+
+# NS and subject_ids from your provided snippet
+NS <- length(alpha_subj)
+subject_ids <- 1:NS
+
+# --- Create DataFrames for Plotting ---
+df_alpha <- data.frame(
+  subject_id = subject_ids,
+  mean_param = alpha_subj,
+  lower_ci = alpha_ci[1, ],
+  upper_ci = alpha_ci[2, ],
+  parameter = "alpha"
+)
+
+df_b0 <- data.frame(
+  subject_id = subject_ids,
+  mean_param = b0_subj_mean,
+  lower_ci = b0_ci[1, ],
+  upper_ci = b0_ci[2, ],
+  parameter = "beta0"
+)
+
+df_b1 <- data.frame(
+  subject_id = subject_ids,
+  mean_param = b1_subj_mean,
+  lower_ci = b1_ci[1, ],
+  upper_ci = b1_ci[2, ],
+  parameter = "beta1"
+)
+
+df_all_params <- bind_rows(df_alpha, df_b0, df_b1) %>%
+  mutate(parameter = factor(parameter, levels = c("alpha", "beta0", "beta1"))) # Ensure order
+
+
+### --- Histograms of Subject-Level Posterior Means for M2 (Combined Plot) ---
+
+# Assign each histogram to a variable with simplified labels for combined view
+h_alpha_m2 <- ggplot(df_alpha, aes(x = mean_param)) +
+  geom_histogram(binwidth = 0.05, fill = "steelblue", color = "white", alpha = 0.8) +
+  labs(title = expression("Learning Rate ("*alpha*")"), x = "", y = "Count") +
+  theme_minimal(base_size = 12) +
+  xlim(0, 1) # Learning rate alpha is between 0 and 1
+
+h_b0_m2 <- ggplot(df_b0, aes(x = mean_param)) +
+  geom_histogram(binwidth = 0.2, fill = "#DD8D9D", color = "white", alpha = 0.8) +
+  labs(title = expression("Intercept ("*beta[0]*")"), x = "", y = "Count") +
+  theme_minimal(base_size = 12)
+
+h_b1_m2 <- ggplot(df_b1, aes(x = mean_param)) +
+  geom_histogram(binwidth = 0.5, fill = "#C28BCD", color = "white", alpha = 0.8) +
+  labs(title = expression("Sensitivity ("*beta[1]*")"), x = "", y = "Count") +
+  theme_minimal(base_size = 12)
+
+# Combine Histograms into a 2x2 grid with an empty space
+combined_histograms_m2 <- (h_alpha_m2 + h_b0_m2) / (h_b1_m2 + plot_spacer()) +
+  plot_annotation(
+    title = "Distributions of Subject-Specific Posterior Means (M2)",
+    caption = "X-axis: Posterior Mean; Y-axis: Number of Subjects"
+  ) & theme(plot.title = element_text(hjust = 0.5)) # Center main title
+
+print(combined_histograms_m2)
+
+
+### --- Caterpillar Plots for Subject-Level Posterior Means and CIs for M2 (Combined Plot) ---
+
+# Order dataframes for caterpillar plots
+df_alpha_ordered <- df_alpha %>%
+  arrange(mean_param) %>%
+  mutate(subject_id = factor(subject_id, levels = subject_id))
+
+df_b0_ordered <- df_b0 %>%
+  arrange(mean_param) %>%
+  mutate(subject_id = factor(subject_id, levels = subject_id))
+
+df_b1_ordered <- df_b1 %>%
+  arrange(mean_param) %>%
+  mutate(subject_id = factor(subject_id, levels = subject_id))
+
+# Assign each caterpillar plot to a variable with simplified labels
+c_alpha_m2 <- ggplot(df_alpha_ordered, aes(x = mean_param, y = subject_id)) +
+  geom_errorbarh(aes(xmin = lower_ci, xmax = upper_ci), height = 0, color = "steelblue") +
+  geom_point(color = "darkblue", size = 1) +
+  labs(title = expression("Learning Rate ("*alpha*")"), x = "", y = "") +
+  theme_minimal(base_size = 12) +
+  theme(axis.text.y = element_blank(), axis.ticks.y = element_blank()) +
+  xlim(0, 1)
+
+c_b0_m2 <- ggplot(df_b0_ordered, aes(x = mean_param, y = subject_id)) +
+  geom_errorbarh(aes(xmin = lower_ci, xmax = upper_ci), height = 0, color = "#F5C7DC") +
+  geom_point(color = "#D35C79" , size = 1) +
+  labs(title = expression("Intercept ("*beta[0]*")"), x = "", y = "") +
+  theme_minimal(base_size = 12) +
+  theme(axis.text.y = element_blank(), axis.ticks.y = element_blank()) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50")
+
+c_b1_m2 <- ggplot(df_b1_ordered, aes(x = mean_param, y = subject_id)) +
+  geom_errorbarh(aes(xmin = lower_ci, xmax = upper_ci), height = 0, color = "#C2A5C9") +
+  geom_point(color ="#4E4290" , size = 1) +
+  labs(title = expression("Sensitivity ("*beta[1]*")"), x = "", y = "") +
+  theme_minimal(base_size = 12) +
+  theme(axis.text.y = element_blank(), axis.ticks.y = element_blank()) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50")
+
+# Combine Caterpillar Plots into a 2x2 grid with an empty space
+combined_caterpillars_m2 <- (c_alpha_m2 + c_b0_m2) / (c_b1_m2 + plot_spacer()) +
+  plot_annotation(
+    title = "Subject-Specific Posterior Means with 95% CIs (M2)",
+    caption = "X-axis: Posterior Mean; Y-axis: Subject ID (ordered by parameter mean)"
+  ) & theme(plot.title = element_text(hjust = 0.5)) # Center main title
+
+print(combined_caterpillars_m2)
+```
+
+#### Learning Rate ($\alpha$)
+
+The posterior distribution of the subject-specific learning rate is predominantly concentrated at relatively small values, although it remains distinctly non-zero. This suggests that for the majority of participants, **learning occurs at a slow but consistent pace**. This finding aligns with the observation from the simplified non-hierarchical model, where a single, small posterior mean for the learning rate was estimated. Crucially, the caterpillar plot for 
+alpha visually confirms this; while most subjects exhibit 
+alpha values clustered at the lower end of the spectrum, it also clearly reveals a small subset of subjects with notably higher posterior mean learning rates. This **individual variability**, captured by the hierarchical structure, underscores the diverse adaptive capacities within the study population.
+
+#### Bias ($\beta_0$)
+
+The histogram for the subject-specific bias reveals a distribution centered broadly around zero, but with tails extending to both positive and negative values. This aligns with our initial exploratory data analysis of individual choice proportions, which indicated that subjects exhibited a range of baseline preferences. The caterpillar plot for 
+$\beta_0$ further elucidates this by showing that some subjects indeed possess a discernible preference towards one choice (e.g., a "Left" bias corresponding to a positive 
+$\beta_0$ mean, or a "Right" bias for a positive $\beta_0$ mean), while the majority of individuals exhibit a very small or negligible intrinsic bias, with their 95% credible intervals often encompassing zero. This highlights the model's ability to differentiate between **truly biased** individuals and those whose baseline choices are **closer to random**.
+
+#### Sensitivity ($\beta_1$)
+
+Each dot in the caterpillar plots indicates the most probable value for that parameter for a specific subject, based on their data and the hierarchical pooling. Shorter horizontal lines (95% CI) indicate more precise estimates. This variability in uncertainty across subjects is natural, as some subjects might have more informative data than others. While showing individual estimates, the credible intervals are implicitly influenced by the group-level distributions. Estimates for subjects with less data or more noise will be "shrunk" more towards the population mean, resulting in more robust and regularized estimates than would be possible with independent non-hierarchical analyses
+
+
+## Model 3 - Analysis
+
+ Model 3 was estimated using $3$ MCMC chains with $5,000$ iterations each ($1,000$ burn-in).
+It provides an extention of the previous model by accounting for choice repetition behavior, as coded by the stickiness additional parameter
+
+```{r fitting M3, eval=FALSE}
+
+# DATALIST WITH STICKINESS X M3 
+
+data3 <- list(
+  "NS" = 205,
+  "NStim" = 4,
+  "NC" = 2,
+  "NT" = trialNum_Gershman,
+  "K" = 3,
+  "stim_id" = state_Gershman,
+  "rew" = reward_Gershman,
+  "choice" = choice_Gershman,
+  "choice_two" = choice_two_Gershman,
+  "stickiness" = stickiness_Gershman
+)
+
+
+#  parameters to save
+params3 <- c(
+  "alpha",
+  "b0",
+  "b1",
+  "kappa",
+  "choice_pred",
+  "betaG",
+  "tau_beta",
+  "SigmaG"
+)
+
+model_M3 <- jags(data = data3,
+               parameters.to.save = params3,
+               model.file = "justanotherM3.jags",
+               n.chains = 3,
+               n.iter = 5000,
+               n.burnin = 1000,
+               n.thin = 5)
+```
+
+### M3 Convergence Diagnostic
+
+```{r M3 convergence diag, echo=FALSE, fig.width=10, fig.height=18}
+plot_trace_and_diagnostics(model_M3, "Model M3")
+```
+
+
+
+The traceplots for Model 3's group-level hyperparameters, specifically the population means ($\beta_G$) and the components of the covariance matrix (\Sigma_G), demonstrate excellent mixing. Despite the increased complexity of the multivariate prior, all chains show robust stationarity and efficient exploration of the parameter space, confirming that the model has successfully converged and is adequately sampling from these high-dimensional posterior distributions.
+
+### M3 Posterior Predictive Checks
+
+```{r PPC M3, echo=FALSE, warning= FALSE}
+library(coda)      # For as.mcmc
+library(bayesplot) # For PPC plots
+library(ggplot2)   # For plot customization
+
+load("model_M3.RData")
+load("choice_two_Gershman.RData")
+
+# --- Define Dimensions 
+NS_original <- 205 # Total number of subjects
+NT_original <- 100 # Total trials per subject in your raw 'choice_two_Gershman' data
+NT_modeled <- NT_original - 1 # This will be 99 (trials 2-100 are 99 trials)
+
+
+mcmc_samples3 <- as.mcmc(model_M3)
+# choice_pred_samples is extracted but not directly used in the bayesplot functions here.
+# If you have other custom plots that use it, ensure they are also optimized.
+choice_pred_samples <- model_M3$BUGSoutput$sims.list$choice_pred
+
+
+## M3 PPC Data Preparation
+
+raw_sims_array3 <- model_M3$BUGSoutput$sims.array
+
+# Get parameter names and find 'choice_pred' indices
+param_names_in_sims_array <- dimnames(raw_sims_array3)[[3]]
+choice_pred_logical_indices <- grepl("^choice_pred\\[", param_names_in_sims_array)
+
+# CRITICAL SANITY CHECKS (Highly recommended to keep these for debugging)
+expected_elements <- NS_original * NT_modeled
+found_elements <- sum(choice_pred_logical_indices)
+
+if (found_elements == 0) {
+  stop("Error: No 'choice_pred' parameters with indices (e.g., choice_pred[s,t]) found in M3 model output.")
+} else if (found_elements != expected_elements) {
+  stop(paste0("CRITICAL DIMENSION MISMATCH in M3: Expected ", expected_elements, " 'choice_pred' elements, but found ", found_elements, ". Please check your JAGS model and R dimensions."))
+}
+
+
+# Extract the relevant simulated data as a flat vector first
+sims_for_choice_pred_values3 <- as.vector(raw_sims_array3[, , choice_pred_logical_indices])
+
+# Determine total number of draws (iterations * chains)
+n_total_draws <- dim(raw_sims_array3)[1] * dim(raw_sims_array3)[2]
+
+# --- This is the key step: Create the yrep_all_draws_reshaped array explicitly ---
+# This is your core M3 posterior predictive data: [total_draws, NS_original, NT_modeled]
+yrep_all_draws_reshaped3 <- array(
+  data = sims_for_choice_pred_values3,
+  dim = c(n_total_draws, NS_original, NT_modeled)
+)
+
+# Flatten observed data (y) - common for all models
+y_obs_flat <- as.vector(choice_two_Gershman[, 2:NT_original])
+
+
+# --- 2. Generate PPC Plots ---
+
+# PPC Plot A: Overall Mean Choice Proportion 
+# ********************************************************************************
+yrep_overall_means_M3_vector <- apply(yrep_all_draws_reshaped3, MARGIN = 1, FUN = mean)
+yrep_overall_means_M3 <- matrix(yrep_overall_means_M3_vector, ncol = 1) # <--- CRUCIAL FIX for M3 Plot A
+
+# Calculate the single observed overall mean (same as M1/M2)
+obs_overall_mean_M3 <- mean(y_obs_flat)
+
+# Plot using ppc_stat with stat = "identity"
+plot_overall_mean_M3 <- ppc_stat(
+  y = obs_overall_mean_M3,       # The single observed statistic
+  yrep = yrep_overall_means_M3,  # The matrix of replicated statistics (one column)
+  stat = "identity",             # Tell bayesplot that yrep *is* the statistic
+  binwidth = 0.0005
+) +
+  ggtitle("PPC (M3): Overall Mean Choice Proportion (Trials 2-100)") + # Clarify for M3
+  xlab("Mean Choice (Proportion of 1s)") +
+  theme_minimal()
+print(plot_overall_mean_M3)
+
+
+# PPC Plot B: Distribution of Mean Choice Proportion Per Subject 
+# ***************************************************************************************
+# Calculate observed mean choice for each subject 
+obs_subj_means <- rowMeans(choice_two_Gershman[, 2:NT_original])
+
+yrep_subj_means_M3 <- t(apply( 
+  X = yrep_all_draws_reshaped3, 
+  MARGIN = 1, # Apply function to each slice along the first dimension (draws)
+  FUN = function(draw_data_slice) {
+    # draw_data_slice will be a matrix of [NS_original, NT_modeled]
+    rowMeans(draw_data_slice) # Returns a vector of length NS_original
+  }
+))
+
+
+plot_subj_means_density_M3 <- ppc_dens_overlay( # Use a distinct name for M3 plot
+  y = obs_subj_means,
+  # This sampling is key for memory efficiency and plot clarity for density overlays
+  yrep = yrep_subj_means_M3[sample(1:n_total_draws, size = min(500, n_total_draws), replace = FALSE), , drop = FALSE],
+  alpha = 0.1
+) +
+  ggtitle("PPC (M3): Distribution of Subject-Level Mean Choice Proportions (Trials 2-100)") + # Clarify for M3
+  xlab("Mean Choice Proportion Per Subject") +
+  theme_minimal()
+print(plot_subj_means_density_M3)
+```
+
+ Crucially, Model 3 further outperforms both Model 1 and Model 2, demonstrating the strongest agreement between its simulated mean choice proportions and the actual observed data. This indicates that Model 3 provides the most accurate and faithful representation of the decision-making process captured in the data, reflecting its enhanced complexity and hierarchical structure.
+
+
+### M3 Results
+
+ Having confirmed the convergence and satisfactory mixing of Model 3 (M3) through diagnostic plots, we now delve into its inferential findings, particularly focusing on the subject-level parameter estimates. Unlike Model 2, M3 additionally estimates a stickiness parameter ($k$) for each subject and models the relationship between bias ($b_0$), inverse temperature ($b_1$), and stickiness ($k$) at the group level. The following plots visualize the distributions of the posterior means for each subject-specific parameter via histograms, and provide a detailed view of individual parameter estimates and their 95% credible intervals through caterpillar plots. These visualizations allow us to gain insight into the range of individual differences and the precision of our parameter estimates within the population.
+
+```{r M3 results, echo = FALSE, fig.height=9, fig.width=9}
+library(patchwork)
+# Make sure you have dplyr, ggplot2, and patchwork loaded
+library(dplyr)
+library(ggplot2)
+library(patchwork) # Load patchwork
+
+# Assuming model_M3 has been run and is available in your environment
+
+# --- 1. Extract Samples for M3 Parameters (simplified access) ---
+results_M3 <- model_M3$BUGSoutput
+
+# Access parameters directly from sims.list
+alpha_samples <- results_M3$sims.list$alpha
+b0_samples <- results_M3$sims.list$b0
+b1_samples <- results_M3$sims.list$b1
+kappa_samples <- results_M3$sims.list$kappa
+
+# Determine the number of subjects
+NS <- ncol(alpha_samples)
+subject_ids <- 1:NS
+
+# --- 2. Calculate Posterior Means and 95% CIs per Subject ---
+alpha_subj_mean <- apply(alpha_samples, 2, mean)
+alpha_ci <- apply(alpha_samples, 2, quantile, probs = c(0.025, 0.975))
+b0_subj_mean <- apply(b0_samples, 2, mean)
+b0_ci <- apply(b0_samples, 2, quantile, probs = c(0.025, 0.975))
+b1_subj_mean <- apply(b1_samples, 2, mean)
+b1_ci <- apply(b1_samples, 2, quantile, probs = c(0.025, 0.975))
+kappa_subj_mean <- apply(kappa_samples, 2, mean)
+kappa_ci <- apply(kappa_samples, 2, quantile, probs = c(0.025, 0.975))
+
+
+# --- 3. Create DataFrames for Plotting ---
+df_alpha <- data.frame(subject_id = subject_ids, mean_param = alpha_subj_mean, lower_ci = alpha_ci[1, ], upper_ci = alpha_ci[2, ], parameter = "alpha")
+df_b0 <- data.frame(subject_id = subject_ids, mean_param = b0_subj_mean, lower_ci = b0_ci[1, ], upper_ci = b0_ci[2, ], parameter = "b0")
+df_b1 <- data.frame(subject_id = subject_ids, mean_param = b1_subj_mean, lower_ci = b1_ci[1, ], upper_ci = b1_ci[2, ], parameter = "b1")
+df_kappa <- data.frame(subject_id = subject_ids, mean_param = kappa_subj_mean, lower_ci = kappa_ci[1, ], upper_ci = kappa_ci[2, ], parameter = "kappa")
+
+# No need for df_all_params_M3 for these combined plots, but keeping for reference if you use it elsewhere.
+df_all_params_M3 <- bind_rows(df_alpha, df_b0, df_b1, df_kappa) %>%
+  mutate(parameter = factor(parameter, levels = c("alpha", "b0", "b1", "kappa")))
+
+
+### --- 4. Histograms of Subject-Level Posterior Means for M3 ---
+
+# Assign each histogram to a variable
+h_alpha <- ggplot(df_alpha, aes(x = mean_param)) +
+  geom_histogram(binwidth = 0.05, fill = "steelblue", color = "white", alpha = 0.8) +
+  labs(title = expression("Learning Rate ("*alpha*")"), x = "", y = "Count") + # Simplified titles
+  theme_minimal(base_size = 12) +
+  xlim(0, 1)
+
+h_b0 <- ggplot(df_b0, aes(x = mean_param)) +
+  geom_histogram(binwidth = 0.2, fill = "#DD8D9D", color = "white", alpha = 0.8) +
+  labs(title = expression("Intercept ("*beta[0]*")"), x = "", y = "Count") + # Simplified titles
+  theme_minimal(base_size = 12)
+
+h_b1 <- ggplot(df_b1, aes(x = mean_param)) +
+  geom_histogram(binwidth = 0.5, fill = "#C28BCD", color = "white", alpha = 0.8) +
+  labs(title = expression("Sensitivity ("*beta[1]*")"), x = "", y = "Count") + # Simplified titles
+  theme_minimal(base_size = 12)
+
+h_kappa <- ggplot(df_kappa, aes(x = mean_param)) +
+  geom_histogram(binwidth = 0.1, fill = "#548e24", color = "white", alpha = 0.8) +
+  labs(title = expression("Stickiness ("*kappa*")"), x = "", y = "Count") + # Simplified titles
+  theme_minimal(base_size = 12)
+
+# Combine Histograms into a 2x2 grid
+# You might want a common x-axis label.
+# Use plot_layout for more control over common axes/labels.
+combined_histograms <- (h_alpha + h_b0) / (h_b1 + h_kappa) +
+  plot_annotation(
+    title = "Distributions of Subject-Specific Posterior Means (M3)",
+    caption = "X-axis: Posterior Mean; Y-axis: Number of Subjects"
+  ) & theme(plot.title = element_text(hjust = 0.5)) # Center main title
+
+print(combined_histograms)
+
+
+### --- 5. Caterpillar Plots for Subject-Level Posterior Means and CIs for M3 ---
+
+# Order dataframes for caterpillar plots
+df_alpha_ordered <- df_alpha %>% arrange(mean_param) %>% mutate(subject_id = factor(subject_id, levels = subject_id))
+df_b0_ordered <- df_b0 %>% arrange(mean_param) %>% mutate(subject_id = factor(subject_id, levels = subject_id))
+df_b1_ordered <- df_b1 %>% arrange(mean_param) %>% mutate(subject_id = factor(subject_id, levels = subject_id))
+df_kappa_ordered <- df_kappa %>% arrange(mean_param) %>% mutate(subject_id = factor(subject_id, levels = subject_id))
+
+
+# Assign each caterpillar plot to a variable
+c_alpha <- ggplot(df_alpha_ordered, aes(x = mean_param, y = subject_id)) +
+  geom_errorbarh(aes(xmin = lower_ci, xmax = upper_ci), height = 0, color = "steelblue") +
+    geom_point(color = "darkblue", size = 1.5) +
+  labs(title = expression("Learning Rate ("*alpha*")"), x = "", y = "") + # Simplified titles, removed y-axis label
+  theme_minimal(base_size = 12) +
+  theme(axis.text.y = element_blank(), axis.ticks.y = element_blank()) +
+  xlim(0, 1)
+
+c_b0 <- ggplot(df_b0_ordered, aes(x = mean_param, y = subject_id)) +
+  geom_errorbarh(aes(xmin = lower_ci, xmax = upper_ci), height = 0, color = "#F5C7DC" ) +
+  geom_point(color ="#D35C79" , size = 1.5) +
+  labs(title = expression("Intercept ("*beta[0]*")"), x = "", y = "") + # Simplified titles, removed y-axis label
+  theme_minimal(base_size = 12) +
+  theme(axis.text.y = element_blank(), axis.ticks.y = element_blank()) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50")
+
+c_b1 <- ggplot(df_b1_ordered, aes(x = mean_param, y = subject_id)) +
+  geom_errorbarh(aes(xmin = lower_ci, xmax = upper_ci), height = 0, color = "#C2A5C9" ) +
+  geom_point(color = "#4E4290", size = 1.5) +
+  labs(title = expression("Sensitivity ("*beta[1]*")"), x = "", y = "") + # Simplified titles, removed y-axis label
+  theme_minimal(base_size = 12) +
+  theme(axis.text.y = element_blank(), axis.ticks.y = element_blank()) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50")
+
+c_kappa <- ggplot(df_kappa_ordered, aes(x = mean_param, y = subject_id)) +
+  geom_errorbarh(aes(xmin = lower_ci, xmax = upper_ci), height = 0, color = "#b3de69") +
+  geom_point(color = "#548e24"  , size = 1.5) +
+  labs(title = expression("Stickiness ("*kappa*")"), x = "", y = "") + # Simplified titles, removed y-axis label
+  theme_minimal(base_size = 12) +
+  theme(axis.text.y = element_blank(), axis.ticks.y = element_blank()) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50")
+
+# Combine Caterpillar Plots into a 2x2 grid
+combined_caterpillars <- (c_alpha + c_b0) / (c_b1 + c_kappa) +
+  plot_annotation(
+    title = "Subject-Specific Posterior Means with 95% CIs (M3)",
+    caption = "X-axis: Posterior Mean; Y-axis: Subject ID (ordered by parameter mean)"
+  ) & theme(plot.title = element_text(hjust = 0.5)) # Center main title
+
+print(combined_caterpillars)
+```
+
+
+# Model Comparison
+
+We can start comparing the models using Deviance Information Criterion — lower values suggest better out-of-sample predictive fit.
+
+```{r model comparison, echo=FALSE}
+# Make sure you have dplyr and knitr loaded
+library(dplyr)
+library(knitr)
+# Extract DIC values
+dic_m1 <- model_M1$BUGSoutput$DIC
+dic_m2 <- model_M2$BUGSoutput$DIC
+dic_m3 <- model_M3$BUGSoutput$DIC
+
+# Create a tibble (or data.frame) with the DIC values
+dic_table <- tibble(
+  Model = c("M1", "M2", "M3"),
+  DIC = c(dic_m1, dic_m2, dic_m3)
+)
+
+# Print the table using kable for nice formatting
+kable(dic_table,
+      caption = "Deviance Information Criterion (DIC) for Models M1, M2, and M3",
+      digits = 2) # Format DIC values to 2 decimal places for readability
+```
+
+The lower DIC for the hierarchical model (M2) with respect to the non hierarchical one (M1) indicates that accounting for individual variability improves model performance.
+
+The enhanced M3 model, which accounts for the additional parameter of stickiness, achieves the best overall DIC.
+
+
+## Reward Recovery
+
+This step helps validate that the estimated learning parameters lead to behavior that is consistent with the actual reward environment.
+
+We use the posterior means of the subject-specific parameters estimated by M2 and M3 to simulate behavior on the same sequence of trials each subject experienced. For each trial, we simulate choices and rewards using:
+
+* the Q-learning update rule with subject-specific $\alpha$,
+
+* a softmax decision rule with subject-specific $\beta_0$ and $\beta_1$ for M2, $\beta_0$ and $\beta_1$ and $\kappa$ for M3,
+
+* the true reward probabilities recorded in the dataset.
+
+We then compare the **simulated behavior** (i.e., the reward rates obtained under simulated choices) with the **true reward probabilities** used in the experiment. A close correspondence between the two would indicate that the model successfully internalizes the structure of the task and recovers the latent reward contingencies.
+
+```{r M2 Reward Probability Recovery, echo = FALSE}
+# Make sure you have dplyr, ggplot2, and patchwork loaded
+library(dplyr)
+library(ggplot2)
+library(patchwork)
+
+# Assuming model_M2 and model_M3 have been run and are available in your environment
+# Assuming rl_data is also available and structured correctly
+
+# --- M2 Reward Probability Recovery Simulation ---
+
+# Extract posterior means for M2 parameters
+alpha_s_M2 <- model_M2$BUGSoutput$mean$alpha
+# Assuming beta[,1] and beta[,2] structure for b0 and b1 in M2
+b0_s_M2    <- model_M2$BUGSoutput$mean$beta[,1]
+b1_s_M2    <- model_M2$BUGSoutput$mean$beta[,2]
+
+# Define dimensions (ensure these match your data)
+subjects <- unique(rl_data$name)
+n_subjects <- length(subjects)
+n_trials <- 100 # This should align with the number of trials in your rl_data
+
+# Initialize an empty data frame to store M2 simulation results
+sim_results_M2 <- data.frame()
+
+# Loop through each subject to simulate choices for M2
+for (s in 1:n_subjects) {
+  subj_data <- rl_data %>% filter(name == subjects[s]) %>% arrange(trial_number)
+  Q <- matrix(0.5, nrow = 4, ncol = 2) # [stimulus_ID, choice_ID (1=left, 2=right)]
+
+  for (t in 1:n_trials) {
+    stim <- as.numeric(subj_data$game[t])
+    prob_left <- as.numeric(subj_data$prob[t])
+    prob_right <- 1 - prob_left
+
+    value_diff <- Q[stim, 1] - Q[stim, 2]
+    p_left <- 1 / (1 + exp(-(b0_s_M2[s] + b1_s_M2[s] * value_diff)))
+    sim_choice <- rbinom(1, 1, p_left)
+    chosen_action <- ifelse(sim_choice == 1, 1, 2)
+    true_prob_chosen_action <- ifelse(chosen_action == 1, prob_left, prob_right)
+    reward <- rbinom(1, 1, true_prob_chosen_action)
+
+    Q[stim, chosen_action] <- Q[stim, chosen_action] +
+      alpha_s_M2[s] * (reward - Q[stim, chosen_action])
+
+    sim_results_M2 <- rbind(sim_results_M2, data.frame(
+      name = subjects[s], trial = t, stim = stim, sim_choice = sim_choice,
+      reward = reward, prob = true_prob_chosen_action
+    ))
+  }
+}
+
+# Aggregate simulated M2 results
+recovery_check_M2 <- sim_results_M2 %>%
+  group_by(name, prob) %>%
+  summarise(mean_reward = mean(reward), .groups = "drop")
+
+# Plotting for M2
+p_m2_recovery <- ggplot(recovery_check_M2, aes(x = prob, y = mean_reward)) +
+  geom_point(alpha = 0.4) +
+  geom_smooth(method = "lm", se = FALSE, color = "#00688B") +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "darkgrey") + # Add y=x line
+  labs(title = "M2: True vs. Simulated Reward Rate",
+       x = "True Reward Probability",
+       y = "Recovered Reward Rate (Mean Simulated Reward)") +
+  theme_minimal(base_size = 12) +
+  coord_cartesian(xlim = c(0, 1), ylim = c(0, 1)) # Ensure consistent axes
+
+
+# --- M3 Reward Probability Recovery Simulation ---
+
+# Extract posterior means for M3 parameters (direct access assumed based on prior fix)
+alpha_s_M3 <- model_M3$BUGSoutput$mean$alpha
+b0_s_M3    <- model_M3$BUGSoutput$mean$b0
+b1_s_M3    <- model_M3$BUGSoutput$mean$b1
+kappa_s_M3 <- model_M3$BUGSoutput$mean$kappa
+
+# Initialize an empty data frame to store M3 simulation results
+sim_results_M3 <- data.frame()
+
+# Loop through each subject to simulate choices for M3
+for (s in 1:n_subjects) {
+  subj_data <- rl_data %>% filter(name == subjects[s]) %>% arrange(trial_number)
+  Q <- matrix(0.5, nrow = 4, ncol = 2)
+  prev_sim_choice <- NA # Initialize for stickiness
+
+  for (t in 1:n_trials) {
+    stim <- as.numeric(subj_data$game[t])
+    prob_left <- as.numeric(subj_data$prob[t])
+    prob_right <- 1 - prob_left
+
+    value_diff <- Q[stim, 1] - Q[stim, 2]
+
+    current_stickiness_effect <- 0
+    if (t > 1) {
+      current_stickiness_effect <- kappa_s_M3[s] * (2 * prev_sim_choice - 1)
+    }
+
+    p_left <- 1 / (1 + exp(-(b0_s_M3[s] + b1_s_M3[s] * value_diff + current_stickiness_effect)))
+    sim_choice <- rbinom(1, 1, p_left)
+    chosen_action <- ifelse(sim_choice == 1, 1, 2)
+    true_prob_chosen_action <- ifelse(chosen_action == 1, prob_left, prob_right)
+    reward <- rbinom(1, 1, true_prob_chosen_action)
+
+    Q[stim, chosen_action] <- Q[stim, chosen_action] +
+      alpha_s_M3[s] * (reward - Q[stim, chosen_action])
+
+    prev_sim_choice <- sim_choice # Update for next trial
+
+    sim_results_M3 <- rbind(sim_results_M3, data.frame(
+      name = subjects[s], trial = t, stim = stim, sim_choice = sim_choice,
+      reward = reward, prob = true_prob_chosen_action
+    ))
+  }
+}
+
+# Aggregate simulated M3 results
+recovery_check_M3 <- sim_results_M3 %>%
+  group_by(name, prob) %>%
+  summarise(mean_reward = mean(reward), .groups = "drop")
+
+# Plotting for M3
+p_m3_recovery <- ggplot(recovery_check_M3, aes(x = prob, y = mean_reward)) +
+  geom_point(alpha = 0.4) +
+  geom_smooth(method = "lm", se = FALSE, color = "#D35C79") + # Changed color for M3
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "darkgrey") + # Add y=x line
+  labs(title = "M3: True vs. Simulated Reward Rate",
+       x = "True Reward Probability",
+       y = "Recovered Reward Rate (Mean Simulated Reward)") +
+  theme_minimal(base_size = 12) +
+  coord_cartesian(xlim = c(0, 1), ylim = c(0, 1)) # Ensure consistent axes
+
+# Combine M2 and M3 plots side-by-side using patchwork
+combined_recovery_plots <- p_m2_recovery + p_m3_recovery
+
+# Print the combined plot
+print(combined_recovery_plots)
+```
+
+The X-axis represents the True Reward Probability, which is the inherent likelihood of receiving a reward for a given action in the simulated trials. The Y-axis, Recovered Reward Rate, shows the average reward observed across simulated subjects for each corresponding true probability.
+
+The blue and pink regression lines, respectively for M2 and M3, which trace the **mean of the simulated data points**, closely aligns with the diagonal ($y = x$).
+
+This indicates that, **on average, both models effectively recover the true underlying reward probabilities**.
+
+The vertical spread of the individual grey and black data points around the blue line at each true reward probability demonstrates the inherent variability in simulated reward rates across different simulated subjects. This spread is expected and reflects several factors:
+
+* Individual Parameter Differences: Each simulated subject operates with their own distinct set of alpha, b0, and b1 parameters (drawn from the posterior distributions), leading to varied learning and decision-making strategies.
+
+* Stochasticity of Choices and Rewards: The simulation process incorporates random elements (e.g., rbinom for choices and rewards), meaning that even subjects with identical parameters, exposed to the same true probability, will experience slightly different reward sequences due to chance.
+
+
+When comparing M2 and M3, both models show good alignment with the $y=x$ line, suggesting that the additional complexity of stickiness in M3 does not impede its ability to faithfully represent the fundamental reward probabilities of the environment. The consistency of this recovery across both models provides confidence that their respective parameter sets allow for the generation of ecologically valid reward feedback within the simulated environment.
+
+
+# Frequentist Comparative Analysis
+
+This section presents a frequentist analysis using a **Generalized Linear Mixed Model** (GLMM) to analyze the behavioral choice data, serving as a critical validation of the findings from the preceding Bayesian hierarchical model (Model M3).
+
+Trial-by-trial Q-values, derived using each participant's individual learning rate (alpha) obtained from the Bayesian Model M3, are incorporated as a key **predictor of choice**. The GLMM examines how decision-making is influenced by these learned value differences and by 'choice stickiness' (previous trial's choice), while accounting for individual variability through random effects.
+
+By comparing the GLMM's fixed effects, random effects, and model fit criteria with their Bayesian counterparts, we assess the robustness and consistency of our reinforcement learning model's parameters across these two distinct statistical frameworks.
+
+```{r Frequentist Q-values computation, echo = FALSE}
+
+library(dplyr)    # For data manipulation (mutate, group_by, join)
+library(lme4)     # For Generalized Linear Mixed Models (glmer)
+library(stringr)  # For string detection (str_detect)
+library(tibble)   # For potential data manipulation (e.g., rownames_to_column)
+# --- Phase 1: Preparation & Data Generation for Frequentist Model ---
+
+# Extract subject-specific posterior means for alpha from M3
+alpha_s_M3 <- model_M3$BUGSoutput$mean$alpha
+
+# Get unique subject IDs from rl_data
+subjects <- unique(rl_data$name)
+n_subjects <- length(subjects)
+
+# --- IMPORTANT CHECK for alpha_s_M3 alignment and naming ---
+if (is.null(names(alpha_s_M3))) {
+  if (length(alpha_s_M3) == n_subjects) {
+    # This assumes the order of alpha_s_M3 values perfectly matches the order of unique(rl_data$name)
+    names(alpha_s_M3) <- subjects
+    cat("  Assigned names to alpha_s_M3 based on unique subject IDs in rl_data.\n")
+  } else {
+    stop("Length of alpha_s_M3 (", length(alpha_s_M3), ") does not match number of unique subjects (", n_subjects, "). Cannot reliably assign names.")
+  }
+}
+# Ensure names are character for robust indexing later, in case they are factors or other types
+names(alpha_s_M3) <- as.character(names(alpha_s_M3))
+
+# Basic check if all subjects in rl_data have a corresponding alpha value
+if (!all(subjects %in% names(alpha_s_M3))) {
+  missing_alphas <- subjects[!subjects %in% names(alpha_s_M3)]
+  stop(paste("Not all subjects in rl_data have a corresponding alpha in model_M3$BUGSoutput$mean$alpha. Missing:", paste(missing_alphas, collapse = ", ")))
+}
+cat(paste0("  Alpha values successfully mapped for ", n_subjects, " subjects.\n"))
+
+# Initialize a list to store computed Q-values and value differences for all subjects
+all_subjects_q_values <- list()
+
+# Loop through each subject to compute Q-values based on their actual data
+for (s_id in subjects) {
+  # Filter and arrange data for the current subject
+  subj_data <- rl_data %>% filter(name == s_id) %>% arrange(trial_number)
+  
+  # Check if subject data is empty
+  if (nrow(subj_data) == 0) {
+    warning(paste0("Skipping subject ", s_id, " due to no data found in rl_data."))
+    next # Skip to the next subject if no data
+  }
+
+  n_trials_subj <- nrow(subj_data)
+
+  # Initialize Q-values matrix for the 4 stimuli (rows) and 2 choices (columns: 1=left, 2=right)
+  # Q-values start at 0.5 (neutral expectation of reward, assuming rewards are between 0 and 1)
+  Q <- matrix(0.5, nrow = 4, ncol = 2) 
+  
+  # Initialize storage for this subject's Q-values and value differences for each trial
+  q_values_subj_df <- data.frame(
+    name = s_id,
+    trial_number = subj_data$trial_number,
+    Q_left = NA,            # Q-value for the left option on this trial (before update)
+    Q_right = NA,           # Q-value for the right option on this trial (before update)
+    value_difference = NA   # Q_left - Q_right for this trial
+  )
+  
+  # Get this subject's alpha posterior mean (already checked for validity above)
+  alpha_subj <- alpha_s_M3[as.character(s_id)] # Ensure s_id is character for lookup
+  
+  # Add a redundant check for alpha_subj, just in case (should not trigger now due to earlier checks)
+  if (length(alpha_subj) == 0 || is.na(alpha_subj) || !is.numeric(alpha_subj) || !is.finite(alpha_subj)) {
+    warning(paste0("Skipping subject ", s_id, " due to unexpected invalid alpha value (should have been caught earlier): ", alpha_subj))
+    next # Skip to the next subject in the loop
+  }
+
+  # Loop through each trial for the current subject
+  for (t in 1:n_trials_subj) {
+    # Extract trial-specific data, convert to numeric/integer safely
+    # Use as.integer(as.character(...)) for robustness against factors or other types
+    current_game <- subj_data$game[t]
+    stim_id <- as.integer(as.character(current_game)) # Ensure it's an integer for indexing
+    
+    # --- UPDATED: Use 'choice_two' column ---
+    current_choice_two <- subj_data$choice_two[t]
+    # Ensure choice is 0 or 1 and convert to numeric for ifelse
+    choice_made <- as.numeric(as.character(current_choice_two)) 
+    
+    # --- UPDATED: Use 'r' column for reward ---
+    reward_received <- as.numeric(subj_data$r[t]) # Ensure reward is numeric
+    
+    # --- Critical Robustness Checks for Q-matrix indexing ---
+    # Check stim_id (row index for Q matrix) for NA, 0, or out-of-bounds values
+    if (is.na(stim_id) || stim_id < 1 || stim_id > nrow(Q)) {
+      stop(paste0("Invalid or out-of-bounds stim_id encountered for Subject: '", s_id,
+                  "', Trial: ", t, ". stim_id value: '", current_game, "' (converted to ", stim_id, ").",
+                  " Expected range: 1 to ", nrow(Q), ". Please check your 'game' column in rl_data."))
+    }
+    
+    # Map choice (0 or 1) to Q-matrix column index (1=left, 2=right)
+    # This assumes choice=1 is Left (Q-idx 1), choice=0 is Right (Q-idx 2)
+    # Adjust if your 'choice_two' mapping is different (e.g., -1/1, 1/2).
+    if (is.na(choice_made) || !choice_made %in% c(0, 1)) {
+       stop(paste0("Invalid or unexpected 'choice_made' value for Subject: '", s_id,
+                   "', Trial: ", t, ". Original choice_two: '", current_choice_two, "' (converted to ", choice_made, ").", # UPDATED message
+                   " Expected 0 or 1. Please check your 'choice_two' column in rl_data.")) # UPDATED message
+    }
+    chosen_Q_idx <- ifelse(choice_made == 1, 1, 2) 
+    
+    # Store Q-values *before* update for current trial's decision rule calculation
+    q_values_subj_df$Q_left[t] <- Q[stim_id, 1]
+    q_values_subj_df$Q_right[t] <- Q[stim_id, 2]
+    q_values_subj_df$value_difference[t] <- Q[stim_id, 1] - Q[stim_id, 2] 
+    
+    # Update Q-value for the chosen action using the Q-learning rule
+    Q[stim_id, chosen_Q_idx] <- Q[stim_id, chosen_Q_idx] +
+      alpha_subj * (reward_received - Q[stim_id, chosen_Q_idx])
+  }
+  
+  # Add the current subject's computed Q-values dataframe to the list
+  all_subjects_q_values[[as.character(s_id)]] <- q_values_subj_df # Store by character ID
+}
+
+# Combine all computed Q-values for all subjects into a single dataframe
+# This will now safely create a non-empty dataframe if subjects were processed
+if (length(all_subjects_q_values) == 0) {
+  stop("No Q-value dataframes were generated. The Q-value computation loop was empty or skipped all subjects. Please review subject data and alpha values.")
+}
+computed_q_values_df <- bind_rows(all_subjects_q_values) 
+
+# Merge original experimental data with the computed Q-values
+merged_data_for_glmm <- left_join(rl_data, computed_q_values_df, by = c("name", "trial_number"))
+
+# Create the 'prev_choice' variable (lagged choice) for the stickiness effect
+merged_data_for_glmm <- merged_data_for_glmm %>%
+  group_by(name) %>% # Group by subject to ensure lag operates within each subject's trials
+  # --- UPDATED: Use 'choice_two' column for lag ---
+  mutate(prev_choice = lag(choice_two, n = 1)) %>% # lag(choice_two, 1) gets the choice from the previous trial
+  ungroup()
+
+# Handle NA values for 'prev_choice' for the first trial of each subject
+# For simplicity, we'll set it to 0. This implies no stickiness effect on the very first trial.
+merged_data_for_glmm <- merged_data_for_glmm %>%
+  mutate(prev_choice = ifelse(is.na(prev_choice), 0, prev_choice))
+
+# Ensure 'subject_ID' is a factor, as required by lme4::glmer for random effects
+merged_data_for_glmm$subject_ID <- factor(merged_data_for_glmm$name)
+
+# Ensure 'choice_two' (the dependent variable) is numeric (0/1)
+# Already handled by as.numeric(as.character(current_choice_two)) in Q-value loop, but explicitly convert again here for consistency
+merged_data_for_glmm$choice_two <- as.numeric(as.character(merged_data_for_glmm$choice_two)) # UPDATED
+
+# --- Phase 3: Fit the Frequentist GLMM ---
+
+freq_model <- glmer(choice_two ~ value_difference + prev_choice + # UPDATED dependent variable
+                      (1 + value_difference + prev_choice | subject_ID),
+                    data = merged_data_for_glmm,
+                    family = binomial(link = "logit"), # Binomial family for binary choices, logit link for logistic regression
+                    control = glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 2e5))) 
+
+cat("  GLMM fitting complete. Summary:\n")
+print(summary(freq_model))
+cat("\n")
+
+# --- Phase 4: Conduct the Comparative Analysis ---
+
+cat(" Conducting Comparative Analysis (Bayesian vs. Frequentist)\n\n")
+
+# --- 1. Compare Fixed Effects (Population-Level Parameters) ---
+cat("--- 1. Comparison of Population-Level (Fixed) Effects ---\n")
+
+# Extract Frequentist Fixed Effects
+freq_fixed_effects <- fixef(freq_model)
+cat("Frequentist Fixed Effects (Estimates for b0_Intercept, b1_ValueDifference, kappa_PrevChoice equivalents):\n")
+print(freq_fixed_effects)
+
+# Extract Bayesian Group Means (betaG from M3)
+bayesian_betaG_means <- model_M3$BUGSoutput$mean$betaG
+# Assign names to Bayesian betaG for clearer comparison (assuming standard order: b0, b1, kappa)
+names(bayesian_betaG_means) <- c("(Intercept)", "value_difference", "prev_choice")
+cat("\nBayesian Group Means (betaG from M3):\n")
+print(bayesian_betaG_means)
+
+# Calculate differences between the aligned parameters
+cat("\nDifferences (Frequentist Estimate - Bayesian Mean) for aligned parameters:\n")
+print(freq_fixed_effects - bayesian_betaG_means)
+cat("\n")
+
+
+# --- 2. Compare Confidence Intervals vs. Credible Intervals ---
+cat("--- 2. Comparison of Intervals ---\n")
+
+# Calculate Frequentist 95% Confidence Intervals
+freq_fixed_se <- sqrt(diag(vcov(freq_model))) # Standard errors for fixed effects
+# Approximate 95% CIs using Z-scores (assumes asymptotic normality, good for large sample sizes)
+freq_fixed_cis_lower <- freq_fixed_effects - 1.96 * freq_fixed_se
+freq_fixed_cis_upper <- freq_fixed_effects + 1.96 * freq_fixed_se
+
+freq_cis_df <- data.frame(
+  Parameter = names(freq_fixed_effects),
+  Lower_CI_Freq = freq_fixed_cis_lower,
+  Upper_CI_Freq = freq_fixed_cis_upper,
+  row.names = NULL
+)
+cat("Frequentist 95% Confidence Intervals:\n")
+print(freq_cis_df)
+
+# Extract Bayesian 95% Credible Intervals (from M3 summary)
+bayesian_betaG_summary_quantiles <- model_M3$BUGSoutput$summary[
+  str_detect(rownames(model_M3$BUGSoutput$summary), "betaG"), # Filter rows for betaG parameters
+  c("2.5%", "97.5%") # Select the 2.5th and 97.5th percentiles for the CI
+]
+# Assign names for clarity, matching the frequentist output structure
+rownames(bayesian_betaG_summary_quantiles) <- c("(Intercept)", "value_difference", "prev_choice")
+bayesian_cis_df <- data.frame(
+  Parameter = rownames(bayesian_betaG_summary_quantiles),
+  Lower_CI_Bayes = bayesian_betaG_summary_quantiles[, "2.5%"],
+  Upper_CI_Bayes = bayesian_betaG_summary_quantiles[, "97.5%"],
+  row.names = NULL
+)
+cat("\nBayesian 95% Credible Intervals:\n")
+print(bayesian_cis_df)
+cat("\n")
+
+
+# --- 3. Compare Random Effects Variances and Covariances ---
+cat("--- 3. Comparison of Individual Differences (Random Effects) ---\n")
+
+# Extract Frequentist Random Effects (Variances and Correlations)
+freq_var_corr_obj <- VarCorr(freq_model) # VarCorr object from lme4
+freq_random_effects_summary <- as.data.frame(freq_var_corr_obj)
+
+cat("Frequentist Random Effects (Variances, Std.Dev., and Correlations from VarCorr):\n")
+print(freq_random_effects_summary)
+
+# Extract Bayesian SigmaG (Group-Level Covariance Matrix) mean
+bayesian_SigmaG_mean <- model_M3$BUGSoutput$mean$SigmaG
+# Assign row/col names for clarity, matching the GLMM parameters (assuming order)
+rownames(bayesian_SigmaG_mean) <- c("(Intercept)", "value_difference", "prev_choice")
+colnames(bayesian_SigmaG_mean) <- c("(Intercept)", "value_difference", "prev_choice")
+cat("\nBayesian Group-Level Covariance Matrix (SigmaG mean from M3):\n")
+print(bayesian_SigmaG_mean)
+
+# Convert Bayesian SigmaG mean to a correlation matrix for easier comparison with GLMM's correlations
+bayesian_corr_matrix <- cov2cor(bayesian_SigmaG_mean)
+cat("\nBayesian Group-Level Correlation Matrix (from SigmaG mean):\n")
+print(bayesian_corr_matrix)
+
+# Calculate Bayesian Posterior Mean Correlation for b1 vs kappa (as an example)
+# This part is made more robust to handle different dimensions of sims_SigmaG
+sims_SigmaG <- model_M3$BUGSoutput$sims.list$SigmaG
+ndim_SigmaG <- length(dim(sims_SigmaG)) # Get the number of dimensions
+
+posterior_corr_b1_kappa_bayesian <- numeric() # Initialize empty numeric vector
+
+if (ndim_SigmaG == 4) {
+  # Expected format: [iterations_per_chain, num_chains, rows, columns]
+  n_iter_per_chain <- dim(sims_SigmaG)[1]
+  n_chains_sims <- dim(sims_SigmaG)[2]
+  total_samples <- n_iter_per_chain * n_chains_sims
+  posterior_corr_b1_kappa_bayesian <- numeric(total_samples) # Pre-allocate
+  
+  idx <- 1
+  for (chain_idx in 1:n_chains_sims) {
+    for (iter_idx in 1:n_iter_per_chain) {
+      current_SigmaG_matrix <- sims_SigmaG[iter_idx, chain_idx, , ]
+      # Assuming order: 1=Intercept, 2=value_difference, 3=prev_choice
+      cov_b1_kappa <- current_SigmaG_matrix[2, 3] 
+      var_b1 <- current_SigmaG_matrix[2, 2]       
+      var_kappa <- current_SigmaG_matrix[3, 3]     
+      
+      if (var_b1 > 0 && var_kappa > 0) {
+        posterior_corr_b1_kappa_bayesian[idx] <- cov_b1_kappa / sqrt(var_b1 * var_kappa)
+      } else {
+        posterior_corr_b1_kappa_bayesian[idx] <- NA # Assign NA if variances are problematic
+      }
+      idx <- idx + 1
+    }
+  }
+} else if (ndim_SigmaG == 3) {
+  # Likely format: [total_iterations_across_chains, rows, columns] (chains already combined)
+  total_samples <- dim(sims_SigmaG)[1]
+  posterior_corr_b1_kappa_bayesian <- numeric(total_samples) # Pre-allocate
+
+  for (sample_idx in 1:total_samples) {
+    current_SigmaG_matrix <- sims_SigmaG[sample_idx, , ]
+    # Assuming order: 1=Intercept, 2=value_difference, 3=prev_choice
+    cov_b1_kappa <- current_SigmaG_matrix[2, 3]
+    var_b1 <- current_SigmaG_matrix[2, 2]
+    var_kappa <- current_SigmaG_matrix[3, 3]
+    
+    if (var_b1 > 0 && var_kappa > 0) {
+      posterior_corr_b1_kappa_bayesian[sample_idx] <- cov_b1_kappa / sqrt(var_b1 * var_kappa)
+    } else {
+      posterior_corr_b1_kappa_bayesian[sample_idx] <- NA
+    }
+  }
+} else {
+  stop(paste0("Unexpected dimensions for model_M3$BUGSoutput$sims.list$SigmaG. Found ", ndim_SigmaG, " dimensions. Expected 3 or 4 dimensions."))
+}
+
+cat("\nBayesian Posterior Mean Correlation (Value Sensitivity [b1] vs Stickiness [kappa]):",
+    round(mean(posterior_corr_b1_kappa_bayesian, na.rm = TRUE), 3), "\n")
+cat("Bayesian 95% CI for Correlation:",
+    round(quantile(posterior_corr_b1_kappa_bayesian, probs = c(0.025, 0.975), na.rm = TRUE), 3), "\n")
+cat("\n")
+
+
+# --- 4. Compare Model Fit Criteria ---
+cat("--- 4. Comparison of Model Fit Criteria ---\n")
+
+cat("Frequentist Model AIC:", round(AIC(freq_model), 2), "\n")
+cat("Frequentist Model BIC:", round(BIC(freq_model), 2), "\n")
+
+cat("\nBayesian Model DIC:", round(model_M3$BUGSoutput$DIC, 2), "\n")
+# If you have WAIC, and it's stored in model_M3 (e.g., model_M3$WAIC), you can uncomment this:
+# cat("Bayesian Model WAIC:", round(model_M3$WAIC, 2), "\n")
+cat("\n")
+
+
+```
+
+This comparison highlights the similarities and differences between the Bayesian and Frequentist approaches:
+  
+1.  **Parameter Estimates:** The fixed effects from GLMM align with Bayesian group means. Such similar values suggest robustness across paradigms.
+
+2.  **Uncertainty:** Frequentist Confidence Intervals and Bayesian Credible Intervals overlap indicating uncertainty is quantified similarly. The agreement in the confidence/credible intervals reinforces the consistency of the findings.
+
+3.  **Individual Differences:**  This is where a **major discrepancy** is observed:
+the frequentist model reports an extremely strong negative correlation between Intercept and prev_choice (-0.97 vs a Bayesian of -0.087). This suggests that the two modeling approaches are capturing the relationship between a subject's general bias and their stickiness in very different ways. It could be due to differences in how the models regularize parameters, their estimation algorithms, or the underlying assumptions.
+The correlation between `value_difference` and `prev_choice` is quite consistent, indicating good agreement on this specific relationship between random slopes.
+
+
+4.  **Model Fit:** AIC/BIC (Frequentist) vs. DIC/WAIC (Bayesian) provide relative fit measures within their respective frameworks. Such measures are calculated differently and are not directly comparable in an absolute sense. They serve as relative measures of model fit within their respective frameworks. The Bayesian DIC being lower than the frequentist AIC suggests that, by its own criteria, the Bayesian model might provide a slightly more favorable balance of fit and complexity.
+
+
+Important Caveat: The learning rate (alpha) is handled differently. In the GLMM, alpha is pre-computed using Bayesian means, not estimated directly by the GLMM, since it is necessary to pre-compute Q-values before fitting it. This means the GLMM's estimates for value_difference and prev_choice are conditional on the alpha values from the Bayesian model.
+
+
+
+---
+
+
+
+
+
+
+
+
