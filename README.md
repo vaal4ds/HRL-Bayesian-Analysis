@@ -18,8 +18,6 @@ This repository contains all the necessary code and materials to reproduce the a
 * **Data Files**:
     * `behavioral_data/GershmanData_d1.csv`, `behavioral_data/GershmanData_d2_block1_test.csv`, etc.: The raw behavioral data files used in the analysis.
     * `rl_data.RData`: An RData file containing the preprocessed and aggregated data, ready for direct use in the JAGS models.
-* **Models Output**:
-   * `model_M1.RData`, `model_M2.RData`, `M3_results.RData` : RData files containing the saved output from the JAGS model fitting procedures for each model.
 
 ## Purpose
 
