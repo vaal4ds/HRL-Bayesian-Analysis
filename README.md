@@ -31,10 +31,10 @@ The primary purpose of this project is to:
 
 ## Data Source
 
-* **Gershman, S. J. (2016).** [Empirical priors for reinforcement learning models
+* **Gershman, S. J. (2016).** [Empirical priors for reinforcement learning models,
  *Github repository*](https://github.com/sjgershm/RL-models).
 
-* **Camilla van Geen (2021)**[Hierarchical Bayesian models of reinforcement learning: tutorial and model comparisons *OSF*](https://osf.io/5r2hf/files/osfstorage?view_only=)
+* **Camilla van Geen (2021).** [Hierarchical Bayesian models of reinforcement learning: tutorial and model comparisons, *OSF*](https://osf.io/5r2hf/files/osfstorage?view_only=)
 
 The data provides trial-by-trial records of choices and outcomes from a two-armed bandit task across multiple participants and experiments.
 
@@ -42,11 +42,10 @@ The data provides trial-by-trial records of choices and outcomes from a two-arme
 
 This project draws inspiration from key literature in computational psychiatry and reinforcement learning, particularly regarding Bayesian hierarchical modeling of behavioral data:
 
-* **Gershman, S. J. (2016).** [Empirical priors for reinforcement learning models
- *Journal of Neuroscience*]([https://github.com/sjgershm/RL-models](https://www.sciencedirect.com/science/article/pii/S0022249616000080?via%3Dihub))
+* **Gershman, S. J. (2016).** [Empirical priors for reinforcement learning models, *Journal of Neuroscience*](https://www.sciencedirect.com/science/article/pii/S0022249616000080?via%3Dihub)
   
 * **Camilla van Geen, Raphael T.Gerraty (2021).**  [Hierarchical Bayesian models of reinforcement learning: Introduction
- and comparison to alternative methods. *Journal of Mathematical Psychology*](https://www.sciencedirect.com/science/article/pii/S0022249621000742?via%3Dihub).
+ and comparison to alternative methods, *Journal of Mathematical Psychology*](https://www.sciencedirect.com/science/article/pii/S0022249621000742?via%3Dihub).
 
 
 
