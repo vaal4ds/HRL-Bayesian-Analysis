@@ -1,0 +1,81 @@
+model {
+
+  # ======== Group-Level Priors (Hyperpriors) ========
+
+  # Beta distribution shape parameters (for alpha) - Fixed for simplicity as requested
+  tau1 <- 1
+  tau2 <- 1
+
+  # Group mean priors for b0, b1, and kappa (bias, inverse temperature, stickiness)
+  betaG[1] ~ dnorm(0, 1 / pow(10, 2))  # mean of b0
+  betaG[2] ~ dnorm(0, 1 / pow(10, 2))  # mean of b1
+  betaG[3] ~ dnorm(0, 1 / pow(10, 2))  # mean of kappa
+
+  # Precision matrix for multivariate normal prior on beta (b0, b1, kappa)
+  # Using a Wishart prior for the precision matrix (tau_beta)
+  # R is the scale matrix, nu is the degrees of freedom.
+  # We need to construct R as an identity matrix within JAGS.
+  nu <- 4 # degrees of freedom = number of parameters (3) + 1
+
+  # Manually construct the identity matrix for R
+  for (i in 1:3) {
+    for (j in 1:3) {
+      R[i,j] <- ifelse(i == j, 0.1, 0) # Diagonal elements 0.1, off-diagonal 0
+    }
+  }
+
+  tau_beta[1:3, 1:3] ~ dwish(R[ , ], nu)
+  SigmaG[1:3, 1:3] <- inverse(tau_beta[ , ]) # Covariance matrix (derived for monitoring)
+
+
+  # ======== Subject-Level Model ========
+
+  for (s in 1:NS) {
+
+    # Learning rate (subject-specific)
+    alpha[s] ~ dbeta(tau1, tau2)
+
+    # Choice parameters from multivariate normal
+    beta[s, 1:3] ~ dmnorm(betaG[1:3], tau_beta[,])
+    b0[s] <- beta[s,1]
+    b1[s] <- beta[s,2]
+    kappa[s] <- beta[s,3]
+
+    # Q-value initialization
+    for (stim in 1:NStim) {
+      for (a in 1:NC) {
+        Q[s, stim, a, 1] <- 0.5
+      }
+    }
+
+    # Trial loop
+    for (t in 2:NT[s]) {
+
+      # Prediction error
+      delta[s, t] <- rew[s, t - 1] - Q[s, stim_id[s, t - 1], choice[s, t - 1], t - 1]
+
+      # Update Q-values
+      for (stim in 1:NStim) {
+        for (a in 1:NC) {
+          Q[s, stim, a, t] <- ifelse(
+            stim == stim_id[s, t - 1] && a == choice[s, t - 1],
+            Q[s, stim, a, t - 1] + alpha[s] * delta[s, t],
+            Q[s, stim, a, t - 1]
+          )
+        }
+      }
+
+      # Compute value difference
+      V[s, t] <- Q[s, stim_id[s, t], 1, t] - Q[s, stim_id[s, t], 2, t]
+
+      # Softmax choice model with stickiness
+      logit(p[s, t]) <- b0[s] + b1[s] * V[s, t] + kappa[s] * stickiness[s, t]
+
+      # Observed binary choice (converted to 0/1 outside JAGS)
+      choice_two[s, t] ~ dbern(p[s, t])
+
+      # Posterior predictive simulation
+      choice_pred[s, t] ~ dbern(p[s, t])
+    }
+  }
+}

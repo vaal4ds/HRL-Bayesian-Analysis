@@ -1,0 +1,80 @@
+model {
+
+  # ======== Group-Level Priors (Hyperpriors) ========
+
+  # Beta distribution shape parameters (for alpha) ~ Half-Cauchy(0, 25)
+  tau1 ~ dnorm(0, 1 / pow(25, 2)) T(0, )  # approximated by truncated normal
+  tau2 ~ dnorm(0, 1 / pow(25, 2)) T(0, )
+
+  # Group mean priors for b0 and b1 (bias and inverse temperature)
+  betaG[1] ~ dnorm(0, 1 / pow(25, 2))  # mean of b0
+  betaG[2] ~ dnorm(0, 1 / pow(25, 2))  # mean of b1
+
+  # Standard deviations for b0 and b1 (Half-Cauchy approx)
+  lambda[1] ~ dnorm(0, 1 / pow(25, 2)) T(0, )  # SD of b0
+  lambda[2] ~ dnorm(0, 1 / pow(25, 2)) T(0, )  # SD of b1
+
+  # Correlation between b0 and b1
+  rho ~ dunif(-1, 1)
+
+  # Construct covariance matrix SigmaG
+  for (i in 1:2) {
+    for (j in 1:2) {
+      Omega[i,j] <- ifelse(i == j, 1, rho)
+      SigmaG[i,j] <- lambda[i] * lambda[j] * Omega[i,j]
+    }
+  }
+
+  # Convert to precision matrix for multivariate normal
+  tau_beta[1:2, 1:2] <- inverse(SigmaG)
+
+  # ======== Subject-Level Model ========
+
+  for (s in 1:NS) {
+
+    # Learning rate (subject-specific)
+    alpha[s] ~ dbeta(tau1, tau2)
+
+    # Choice parameters from multivariate normal
+    beta[s, 1:2] ~ dmnorm(betaG[1:2], tau_beta[,])
+    b0[s] <- beta[s,1]
+    b1[s] <- beta[s,2]
+
+    # Q-value initialization
+    for (stim in 1:NStim) {
+      for (a in 1:NC) {
+        Q[s, stim, a, 1] <- 0.5
+      }
+    }
+
+    # Trial loop
+    for (t in 2:NT[s]) {
+
+      # Prediction error
+      delta[s, t] <- rew[s, t - 1] - Q[s, stim_id[s, t - 1], choice[s, t - 1], t - 1]
+
+      # Update Q-values
+      for (stim in 1:NStim) {
+        for (a in 1:NC) {
+          Q[s, stim, a, t] <- ifelse(
+            stim == stim_id[s, t - 1] && a == choice[s, t - 1],
+            Q[s, stim, a, t - 1] + alpha[s] * delta[s, t],
+            Q[s, stim, a, t - 1]
+          )
+        }
+      }
+
+      # Compute value difference
+      V[s, t] <- Q[s, stim_id[s, t], 1, t] - Q[s, stim_id[s, t], 2, t]
+
+      # Softmax choice model (logistic regression)
+      logit(p[s, t]) <- b0[s] + b1[s] * V[s, t]
+
+      # Observed binary choice (converted to 0/1 outside JAGS)
+      choice_two[s, t] ~ dbern(p[s, t])
+      
+      # Posterior predictive simulation
+      choice_pred[s, t] ~ dbern(p[s, t])
+    }
+  }
+}
