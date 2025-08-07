@@ -19,7 +19,7 @@ This repository contains all the necessary code and materials to reproduce the a
     * `behavioral_data/GershmanData_d1.csv`, `behavioral_data/GershmanData_d2_block1_test.csv`, etc.: The raw behavioral data files used in the analysis.
     * `rl_data.RData`: An RData file containing the preprocessed and aggregated data, ready for direct use in the JAGS models.
 * **Models Output**:
-   * `model_M1.RData`, `model_M2.RData`, `M3_results.RData` **: RData files containing the saved output from the JAGS model fitting procedures for each model.
+   * `model_M1.RData`, `model_M2.RData`, `M3_results.RData` : RData files containing the saved output from the JAGS model fitting procedures for each model.
 
 ## Purpose
 
@@ -31,8 +31,10 @@ The primary purpose of this project is to:
 
 ## Data Source
 
-The behavioral data used in this project is sourced from:
-* **Gershman, S. J., Markman, A. B., & Otto, A. R. (2015).** The role of working memory in reinforcement learning. *Journal of Neuroscience*, 35(34), 11820-11829.
+* **Gershman, S. J. (2016).** [Empirical priors for reinforcement learning models
+ *Github repository*](https://github.com/sjgershm/RL-models).
+
+* **Camilla van Geen (2021)**[Hierarchical Bayesian models of reinforcement learning: tutorial and model comparisons *OSF*](https://osf.io/5r2hf/files/osfstorage?view_only=)
 
 The data provides trial-by-trial records of choices and outcomes from a two-armed bandit task across multiple participants and experiments.
 
@@ -40,7 +42,11 @@ The data provides trial-by-trial records of choices and outcomes from a two-arme
 
 This project draws inspiration from key literature in computational psychiatry and reinforcement learning, particularly regarding Bayesian hierarchical modeling of behavioral data:
 
-* **Gershman, S. J., Markman, A. B., & Otto, A. R. (2015).** The role of working memory in reinforcement learning. *Journal of Neuroscience*, 35(34), 11820-11829. (Primary data source and conceptual framework for the task design).
-* **Gershman, S. J. (2021).** Computational psychiatry: A primer. *Journal of Mathematical Psychology*, 102602. (Provides foundational concepts for applying computational models to behavioral data).
-* **Wiecki, T. V., Sofer, D., & Frank, M. J. (2013).** Posterior predictive checks for computational models of behavior. *Journal of Mathematical Psychology*, 57(3), 127-138. (Guidance on implementing and interpreting posterior predictive checks in behavioral modeling).
-* **Ahn, W. Y., Busemeyer, J. R., Wagenmakers, E. J., & Stout, J. C. (2008).** Comparison of computational models of reinforcement learning. *Journal of Mathematical Psychology*, 52(4), 195-207. (General inspiration for comparing different RL model architectures).
+* **Gershman, S. J. (2016).** [Empirical priors for reinforcement learning models
+ *Journal of Neuroscience*]([https://github.com/sjgershm/RL-models](https://www.sciencedirect.com/science/article/pii/S0022249616000080?via%3Dihub))
+  
+* **Camilla van Geen, Raphael T.Gerraty (2021).**  [Hierarchical Bayesian models of reinforcement learning: Introduction
+ and comparison to alternative methods. *Journal of Mathematical Psychology*](https://www.sciencedirect.com/science/article/pii/S0022249621000742?via%3Dihub).
+
+
+
